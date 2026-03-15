@@ -31,6 +31,8 @@ type Config struct {
 	Quiet            *bool               `toml:"quiet,omitempty"`              // global default for quiet mode; project-level overrides this
 	Cron             CronConfig          `toml:"cron"`
 	Webhook          WebhookConfig       `toml:"webhook"`
+	AuthWebhook       string              `toml:"auth_webhook"`                  // URL for message authentication webhook
+	AuthWebhookSecret string              `toml:"auth_webhook_secret"`           // shared secret for webhook auth
 	IdleTimeoutMins  *int                `toml:"idle_timeout_mins,omitempty"`  // max minutes between agent events; 0 = no timeout; default 120
 }
 

@@ -287,6 +287,12 @@ func main() {
 			return config.SaveDisplayConfig(thinkingMaxLen, toolMaxLen)
 		})
 
+		// Wire auth webhook
+		if cfg.AuthWebhook != "" {
+			engine.SetAuthWebhook(cfg.AuthWebhook, cfg.AuthWebhookSecret)
+			slog.Info("auth webhook enabled", "project", proj.Name, "url", cfg.AuthWebhook)
+		}
+
 		// Wire idle timeout
 		if cfg.IdleTimeoutMins != nil {
 			mins := *cfg.IdleTimeoutMins
@@ -844,6 +850,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload admin allowlist
 	engine.SetAdminFrom(proj.AdminFrom)
+
+	// Reload auth webhook
+	engine.SetAuthWebhook(cfg.AuthWebhook, cfg.AuthWebhookSecret)
 
 	slog.Info("config reloaded", "project", projName)
 	return result, nil

@@ -1,12 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,6 +168,8 @@ type Engine struct {
 	streamPreview    StreamPreviewCfg
 	relayManager     *RelayManager
 	eventIdleTimeout time.Duration
+	authWebhookURL    string // URL to call for message authentication
+	authWebhookSecret string // shared secret sent as X-Webhook-Secret header
 
 	// Multi-workspace mode
 	multiWorkspace    bool
@@ -501,6 +505,11 @@ func (e *Engine) SetEventIdleTimeout(d time.Duration) {
 	e.eventIdleTimeout = d
 }
 
+func (e *Engine) SetAuthWebhook(url, secret string) {
+	e.authWebhookURL = url
+	e.authWebhookSecret = secret
+}
+
 func (e *Engine) SetRelayManager(rm *RelayManager) {
 	e.relayManager = rm
 }
@@ -797,6 +806,71 @@ func (e *Engine) resolveAlias(content string) string {
 	return content
 }
 
+// checkAuthWebhook calls the external auth webhook to verify the message.
+// Returns true if the message should be processed, false if denied.
+func (e *Engine) checkAuthWebhook(p Platform, msg *Message) bool {
+	type webhookReq struct {
+		Platform   string `json:"platform"`
+		UserID     string `json:"user_id"`
+		UserName   string `json:"user_name"`
+		SessionKey string `json:"session_key"`
+	}
+	type webhookResp struct {
+		Allowed bool   `json:"allowed"`
+		Message string `json:"message,omitempty"` // denial message to send to user
+	}
+
+	body, _ := json.Marshal(webhookReq{
+		Platform:   msg.Platform,
+		UserID:     msg.UserID,
+		UserName:   msg.UserName,
+		SessionKey: msg.SessionKey,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", e.authWebhookURL, bytes.NewReader(body))
+	if err != nil {
+		slog.Error("auth webhook: request creation failed", "error", err)
+		return true // fail open — allow if webhook is broken
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if e.authWebhookSecret != "" {
+		req.Header.Set("X-Webhook-Secret", e.authWebhookSecret)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Warn("auth webhook: request failed, allowing message", "error", err)
+		return true // fail open
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		slog.Warn("auth webhook: non-200 response, allowing message", "status", resp.StatusCode)
+		return true // fail open
+	}
+
+	var result webhookResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		slog.Warn("auth webhook: decode failed, allowing message", "error", err)
+		return true // fail open
+	}
+
+	if !result.Allowed {
+		if result.Message != "" {
+			// Send denial message back to the user
+			e.reply(p, msg.ReplyCtx, result.Message)
+		}
+		slog.Info("auth webhook: message denied", "user", msg.UserID, "reason", result.Message)
+		return false
+	}
+
+	return true
+}
+
 func (e *Engine) handleMessage(p Platform, msg *Message) {
 	slog.Info("message received",
 		"platform", msg.Platform, "msg_id", msg.MessageID,
@@ -804,6 +878,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		"content_len", len(msg.Content),
 		"has_images", len(msg.Images) > 0, "has_audio", msg.Audio != nil, "has_files", len(msg.Files) > 0,
 	)
+
+	// Auth webhook check
+	if e.authWebhookURL != "" {
+		if !e.checkAuthWebhook(p, msg) {
+			return // webhook denied or returned an error message
+		}
+	}
 
 	// Voice message: transcribe to text first
 	if msg.Audio != nil {

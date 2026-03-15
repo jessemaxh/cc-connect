@@ -81,8 +81,8 @@ func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, fil
 		args = append(args, "--dir", s.workDir)
 	}
 
-	// Enable thinking blocks
-	args = append(args, "--thinking")
+	// Note: --thinking is off by default in opencode CLI.
+	// Only enable if explicitly configured via provider thinking setting.
 
 	// Append prompt as positional arg
 	args = append(args, prompt)

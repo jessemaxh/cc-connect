@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,10 +165,10 @@ type Engine struct {
 	disabledCmds map[string]bool
 	adminFrom    string // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
 
-	rateLimiter      *RateLimiter
-	streamPreview    StreamPreviewCfg
-	relayManager     *RelayManager
-	eventIdleTimeout time.Duration
+	rateLimiter       *RateLimiter
+	streamPreview     StreamPreviewCfg
+	relayManager      *RelayManager
+	eventIdleTimeout  time.Duration
 	authWebhookURL    string // URL to call for message authentication
 	authWebhookSecret string // shared secret sent as X-Webhook-Secret header
 
@@ -1352,7 +1353,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 
-	e.processInteractiveEvents(state, session, interactiveKey, msg.MessageID, turnStart)
+	e.processInteractiveEvents(state, session, interactiveKey, msg, msg.Content, agent, msg.MessageID, turnStart)
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -1557,11 +1558,12 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessionKey string, msgID string, turnStart time.Time) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessionKey string, msg *Message, inputText string, agent Agent, msgID string, turnStart time.Time) {
 	var textParts []string
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
+	var latestUsage *UsageMetrics
 
 	state.mu.Lock()
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx)
@@ -1656,6 +1658,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventText:
+			if event.Usage != nil {
+				latestUsage = event.Usage
+			}
 			if event.Content != "" {
 				textParts = append(textParts, event.Content)
 				if sp.canPreview() {
@@ -1741,6 +1746,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventResult:
+			if event.Usage != nil {
+				latestUsage = event.Usage
+			}
 			if event.SessionID != "" {
 				session.mu.Lock()
 				session.AgentSessionID = event.SessionID
@@ -1778,6 +1786,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
 					if err := p.Send(e.ctx, replyCtx, chunk); err != nil {
 						slog.Error("failed to send reply", "error", err, "msg_id", msgID)
+						e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", fmt.Sprintf("failed to send reply: %v", err))
 						return
 					}
 				}
@@ -1798,12 +1807,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
+			e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(turnDuration.Milliseconds()), "success", "")
+
 			return
 
 		case EventError:
 			sp.finish("") // clean up preview on error
+			if event.Usage != nil {
+				latestUsage = event.Usage
+			}
 			if event.Error != nil {
 				slog.Error("agent error", "error", event.Error)
+				e.logUsageAsync(msg, agent, inputText, strings.Join(textParts, ""), latestUsage, int(time.Since(turnStart).Milliseconds()), "error", event.Error.Error())
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}
 			return
@@ -1831,7 +1846,97 @@ channelClosed:
 				e.send(p, replyCtx, chunk)
 			}
 		}
+
+		e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly")
+		return
 	}
+
+	e.logUsageAsync(msg, agent, inputText, "", latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly")
+}
+
+func (e *Engine) logUsageAsync(msg *Message, agent Agent, inputText, outputText string, usage *UsageMetrics, latencyMs int, status, errorMessage string) {
+	if e.authWebhookURL == "" || msg == nil {
+		return
+	}
+
+	logURL, err := usageLogURL(e.authWebhookURL)
+	if err != nil {
+		slog.Warn("usage log: invalid auth webhook URL", "error", err)
+		return
+	}
+
+	model := "unknown"
+	if switcher, ok := agent.(interface{ GetModel() string }); ok {
+		if m := switcher.GetModel(); m != "" {
+			model = m
+		}
+	}
+
+	inputTokens := 0
+	outputTokens := 0
+	costCents := 0
+	if usage != nil {
+		inputTokens = usage.InputTokens
+		outputTokens = usage.OutputTokens
+		costCents = usage.CostCents
+	}
+
+	payload := map[string]any{
+		"platform":          msg.Platform,
+		"user_id":           msg.UserID,
+		"session_key":       msg.SessionKey,
+		"model":             model,
+		"input_text":        inputText,
+		"input_tokens":      inputTokens,
+		"output_text":       outputText,
+		"output_tokens":     outputTokens,
+		"latency_ms":        latencyMs,
+		"cost_cents":        costCents,
+		"status":            status,
+		"error_message":     errorMessage,
+		"network_bytes_in":  0,
+		"network_bytes_out": 0,
+		"compute_seconds":   0,
+	}
+
+	go func() {
+		body, _ := json.Marshal(payload)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, logURL, bytes.NewReader(body))
+		if err != nil {
+			slog.Warn("usage log: request creation failed", "error", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if e.authWebhookSecret != "" {
+			req.Header.Set("X-Webhook-Secret", e.authWebhookSecret)
+		}
+
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			slog.Warn("usage log: request failed", "error", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("usage log: non-200 response", "status", resp.StatusCode)
+		}
+	}()
+}
+
+func usageLogURL(authWebhookURL string) (string, error) {
+	parsed, err := url.Parse(authWebhookURL)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasSuffix(parsed.Path, "/verify") {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/verify") + "/log"
+		return parsed.String(), nil
+	}
+	return "", fmt.Errorf("auth webhook path %q does not end with /verify", parsed.Path)
 }
 
 // ──────────────────────────────────────────────────────────────

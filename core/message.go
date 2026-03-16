@@ -154,10 +154,10 @@ const (
 
 // UserQuestion represents a structured question from AskUserQuestion.
 type UserQuestion struct {
-	Question    string             `json:"question"`
-	Header      string             `json:"header"`
+	Question    string               `json:"question"`
+	Header      string               `json:"header"`
 	Options     []UserQuestionOption `json:"options"`
-	MultiSelect bool               `json:"multiSelect"`
+	MultiSelect bool                 `json:"multiSelect"`
 }
 
 // UserQuestionOption is one choice in a UserQuestion.
@@ -177,8 +177,18 @@ type Event struct {
 	SessionID    string         // agent-managed session ID for conversation continuity
 	RequestID    string         // unique request ID for EventPermissionRequest
 	Questions    []UserQuestion // populated when ToolName == "AskUserQuestion"
+	Usage        *UsageMetrics
 	Done         bool
 	Error        error
+}
+
+// UsageMetrics is a normalized per-turn usage payload that agent adapters can fill.
+// CostCents is stored in whole cents for downstream billing.
+type UsageMetrics struct {
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	CostCents    int
 }
 
 // HistoryEntry is one turn in a conversation.

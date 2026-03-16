@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"sync"
@@ -22,31 +23,41 @@ import (
 // Each Send() launches a new `opencode run --format json` process
 // with --session for conversation continuity.
 type opencodeSession struct {
-	cmd      string
-	workDir  string
-	model    string
-	mode     string
-	extraEnv []string
-	events   chan core.Event
-	chatID   atomic.Value // stores string — OpenCode session ID
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	alive    atomic.Bool
+	cmd          string
+	workDir      string
+	model        string
+	mode         string
+	extraEnv     []string
+	events       chan core.Event
+	chatID       atomic.Value // stores string — OpenCode session ID
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	alive        atomic.Bool
+	usageMu      sync.Mutex
+	latestUsage  *core.UsageMetrics
+	usageAdapter usageAdapter
 }
+
+type usageAdapter interface {
+	ExtractUsage(raw map[string]any) (*core.UsageMetrics, bool)
+}
+
+type opencodeUsageAdapter struct{}
 
 func newOpencodeSession(ctx context.Context, cmd, workDir, model, mode, resumeID string, extraEnv []string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	s := &opencodeSession{
-		cmd:      cmd,
-		workDir:  workDir,
-		model:    model,
-		mode:     mode,
-		extraEnv: extraEnv,
-		events:   make(chan core.Event, 64),
-		ctx:      sessionCtx,
-		cancel:   cancel,
+		cmd:          cmd,
+		workDir:      workDir,
+		model:        model,
+		mode:         mode,
+		extraEnv:     extraEnv,
+		events:       make(chan core.Event, 64),
+		ctx:          sessionCtx,
+		cancel:       cancel,
+		usageAdapter: opencodeUsageAdapter{},
 	}
 	s.alive.Store(true)
 
@@ -65,6 +76,10 @@ func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, fil
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
+
+	s.usageMu.Lock()
+	s.latestUsage = nil
+	s.usageMu.Unlock()
 
 	chatID := s.CurrentSessionID()
 	isResume := chatID != ""
@@ -162,7 +177,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 
 	// Emit EventResult after all steps are done and the process has finished writing.
 	sid := s.CurrentSessionID()
-	evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true}
+	evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true, Usage: s.currentUsage()}
 	select {
 	case s.events <- evt:
 	case <-s.ctx.Done():
@@ -362,7 +377,88 @@ func (s *opencodeSession) handleStepStart(raw map[string]any) {
 func (s *opencodeSession) handleStepFinish(raw map[string]any) {
 	part, _ := raw["part"].(map[string]any)
 	reason, _ := part["reason"].(string)
+	if usage, ok := s.usageAdapter.ExtractUsage(raw); ok {
+		s.usageMu.Lock()
+		s.latestUsage = usage
+		s.usageMu.Unlock()
+	}
 	slog.Debug("opencodeSession: step finished", "reason", reason, "session_id", s.CurrentSessionID())
+}
+
+func (s *opencodeSession) currentUsage() *core.UsageMetrics {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	if s.latestUsage == nil {
+		return nil
+	}
+	usage := *s.latestUsage
+	return &usage
+}
+
+func (opencodeUsageAdapter) ExtractUsage(raw map[string]any) (*core.UsageMetrics, bool) {
+	part, _ := raw["part"].(map[string]any)
+	if part == nil {
+		return nil, false
+	}
+
+	tokensRaw, _ := part["tokens"].(map[string]any)
+	costRaw, hasCost := asFloat(part["cost"])
+	if tokensRaw == nil && !hasCost {
+		return nil, false
+	}
+
+	usage := &core.UsageMetrics{}
+	if tokensRaw != nil {
+		usage.TotalTokens, _ = asInt(tokensRaw["total"])
+		usage.InputTokens, _ = asInt(tokensRaw["input"])
+		usage.OutputTokens, _ = asInt(tokensRaw["output"])
+	}
+	if hasCost {
+		usage.CostCents = int(math.Round(costRaw * 100))
+	}
+	return usage, true
+}
+
+func asInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case float32:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			return int(i), true
+		}
+		f, err := n.Float64()
+		if err == nil {
+			return int(f), true
+		}
+	}
+	return 0, false
+}
+
+func asFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		if err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 // RespondPermission is a no-op — OpenCode handles permissions internally.

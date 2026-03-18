@@ -19,7 +19,6 @@ import (
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/daemon"
-
 	// Agent and platform imports are in separate plugin_*.go files
 	// controlled by build tags. See Makefile for selective compilation.
 )
@@ -48,6 +47,9 @@ func main() {
 			return
 		case "send":
 			runSend(os.Args[2:])
+			return
+		case "runtime-status":
+			runRuntimeStatus(os.Args[2:])
 			return
 		case "cron":
 			runCron(os.Args[2:])

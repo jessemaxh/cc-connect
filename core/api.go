@@ -56,6 +56,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 		engines:    make(map[string]*Engine),
 	}
 	s.mux.HandleFunc("/send", s.handleSend)
+	s.mux.HandleFunc("/runtime/status", s.handleRuntimeStatus)
 	s.mux.HandleFunc("/sessions", s.handleSessions)
 	s.mux.HandleFunc("/cron/add", s.handleCronAdd)
 	s.mux.HandleFunc("/cron/list", s.handleCronList)
@@ -65,6 +66,26 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
 
 	return s, nil
+}
+
+func (s *APIServer) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	activeTurns := 0
+	for _, e := range s.engines {
+		activeTurns += e.ActiveTurns()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{
+		"active_turns": activeTurns,
+	})
 }
 
 func (s *APIServer) SocketPath() string {

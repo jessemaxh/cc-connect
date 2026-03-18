@@ -2,7 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +63,15 @@ func (p *stubPlatformEngine) Send(_ context.Context, _ any, content string) erro
 	return nil
 }
 func (p *stubPlatformEngine) Stop() error { return nil }
+
+type stubReconstructPlatform struct {
+	stubPlatformEngine
+	replyCtx any
+}
+
+func (p *stubReconstructPlatform) ReconstructReplyCtx(_ string) (any, error) {
+	return p.replyCtx, nil
+}
 
 type stubInlineButtonPlatform struct {
 	stubPlatformEngine
@@ -2578,4 +2590,102 @@ func TestSplitMessageUTF8Safety(t *testing.T) {
 			t.Errorf("chunk[0] = %q, want %q", chunks[0], "你好\n")
 		}
 	})
+}
+
+func TestExecuteCronJobChecksAuthWebhookBeforeExecution(t *testing.T) {
+	p := &stubReconstructPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		replyCtx:           "reply",
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload["user_id"] != "cron" {
+			t.Fatalf("user_id = %v, want cron", payload["user_id"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"allowed": false,
+			"message": "quota exceeded",
+		})
+	}))
+	defer server.Close()
+
+	e.SetAuthWebhook(server.URL, "secret")
+
+	job := &CronJob{
+		ID:          "job-1",
+		SessionKey:  "feishu:test-session",
+		Prompt:      "summarize logs",
+		Description: "Daily summary",
+	}
+
+	err := e.ExecuteCronJob(job)
+	if err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("err = %v, want denied error", err)
+	}
+	if len(p.sent) != 1 || p.sent[0] != "quota exceeded" {
+		t.Fatalf("sent = %v, want only denial message", p.sent)
+	}
+}
+
+func TestExecuteCronShellLogsUsage(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	logged := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/api/internal/log") {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		logged <- payload
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "logged"})
+	}))
+	defer server.Close()
+
+	e.SetAuthWebhook(server.URL+"/api/internal/verify?project_id=test-project", "secret")
+	msg := &Message{
+		SessionKey: "feishu:test-session",
+		Platform:   "feishu",
+		UserID:     "cron",
+		UserName:   "cron",
+		Content:    "echo hello",
+		ReplyCtx:   "reply",
+	}
+	job := &CronJob{
+		ID:         "job-1",
+		SessionKey: "feishu:test-session",
+		Exec:       "printf 'hello'",
+	}
+
+	if err := e.executeCronShell(p, "reply", msg, job); err != nil {
+		t.Fatalf("executeCronShell() error = %v", err)
+	}
+
+	select {
+	case payload := <-logged:
+		if payload["model"] != "shell" {
+			t.Fatalf("model = %v, want shell", payload["model"])
+		}
+		if payload["input_text"] != "printf 'hello'" {
+			t.Fatalf("input_text = %v", payload["input_text"])
+		}
+		if payload["output_text"] != "hello" {
+			t.Fatalf("output_text = %v", payload["output_text"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for usage log")
+	}
 }

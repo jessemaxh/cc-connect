@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -186,6 +187,8 @@ type Engine struct {
 
 	quietMu sync.RWMutex
 	quiet   bool // when true, suppress thinking and tool progress messages globally
+
+	activeTurns atomic.Int32
 }
 
 // workspaceInitFlow tracks a channel that is being onboarded to a workspace.
@@ -559,6 +562,23 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return fmt.Errorf("reconstruct reply context: %w", err)
 	}
 
+	msg := &Message{
+		SessionKey: sessionKey,
+		Platform:   platformName,
+		UserID:     "cron",
+		UserName:   "cron",
+		Content:    job.Prompt,
+		ReplyCtx:   replyCtx,
+	}
+
+	if job.IsShellJob() && msg.Content == "" {
+		msg.Content = job.Exec
+	}
+
+	if e.authWebhookURL != "" && !e.checkAuthWebhook(targetPlatform, msg) {
+		return fmt.Errorf("cron denied by auth/quota policy")
+	}
+
 	// Notify user that a cron job is executing (unless silent)
 	silent := false
 	if e.cronScheduler != nil {
@@ -577,16 +597,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	if job.IsShellJob() {
-		return e.executeCronShell(targetPlatform, replyCtx, job)
-	}
-
-	msg := &Message{
-		SessionKey: sessionKey,
-		Platform:   platformName,
-		UserID:     "cron",
-		UserName:   "cron",
-		Content:    job.Prompt,
-		ReplyCtx:   replyCtx,
+		return e.executeCronShell(targetPlatform, replyCtx, msg, job)
 	}
 
 	session := e.sessions.GetOrCreateActive(sessionKey)
@@ -599,7 +610,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 }
 
 // executeCronShell runs a shell command for a cron job and sends the output.
-func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error {
+func (e *Engine) executeCronShell(p Platform, replyCtx any, msg *Message, job *CronJob) error {
 	workDir := job.WorkDir
 	if workDir == "" {
 		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
@@ -610,6 +621,12 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 		workDir, _ = os.Getwd()
 	}
 
+	startedAt := time.Now()
+	networkStart, netErr := capturePodNetworkSnapshot()
+	if netErr != nil {
+		slog.Debug("network usage: shell cron start snapshot unavailable", "error", netErr)
+	}
+
 	ctx, cancel := context.WithTimeout(e.ctx, cronJobTimeout)
 	defer cancel()
 
@@ -618,7 +635,9 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 	output, err := cmd.CombinedOutput()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		e.send(p, replyCtx, fmt.Sprintf("⏰ ⚠️ timeout: `%s`", truncateStr(job.Exec, 60)))
+		timeoutMsg := fmt.Sprintf("⏰ ⚠️ timeout: `%s`", truncateStr(job.Exec, 60))
+		e.send(p, replyCtx, timeoutMsg)
+		e.logUsageAsync(msg, nil, job.Exec, "", nil, int(time.Since(startedAt).Milliseconds()), "error", "shell command timed out", measureTurnNetwork(networkStart))
 		return fmt.Errorf("shell command timed out")
 	}
 
@@ -629,6 +648,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 		} else {
 			e.send(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: %v", truncateStr(job.Exec, 60), err))
 		}
+		e.logUsageAsync(msg, nil, job.Exec, result, nil, int(time.Since(startedAt).Milliseconds()), "error", err.Error(), measureTurnNetwork(networkStart))
 		return fmt.Errorf("shell: %w", err)
 	}
 
@@ -636,6 +656,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 		result = "(no output)"
 	}
 	e.send(p, replyCtx, fmt.Sprintf("⏰ ✅ `%s`\n\n%s", truncateStr(job.Exec, 60), truncateStr(result, 3000)))
+	e.logUsageAsync(msg, nil, job.Exec, result, nil, int(time.Since(startedAt).Milliseconds()), "success", "", measureTurnNetwork(networkStart))
 	return nil
 }
 
@@ -1260,12 +1281,18 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, interactiveKey string, workspaceDir string) {
 	defer session.Unlock()
+	e.activeTurns.Add(1)
+	defer e.activeTurns.Add(-1)
 
 	if e.ctx.Err() != nil {
 		return
 	}
 
 	turnStart := time.Now()
+	networkStart, netErr := capturePodNetworkSnapshot()
+	if netErr != nil {
+		slog.Debug("network usage: start snapshot unavailable", "error", netErr)
+	}
 
 	e.i18n.DetectAndSet(msg.Content)
 	session.AddHistory("user", msg.Content)
@@ -1353,7 +1380,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 
-	e.processInteractiveEvents(state, session, interactiveKey, msg, msg.Content, agent, msg.MessageID, turnStart)
+	e.processInteractiveEvents(state, session, interactiveKey, msg, msg.Content, agent, msg.MessageID, turnStart, networkStart)
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -1558,7 +1585,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessionKey string, msg *Message, inputText string, agent Agent, msgID string, turnStart time.Time) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessionKey string, msg *Message, inputText string, agent Agent, msgID string, turnStart time.Time, networkStart *podNetworkSnapshot) {
 	var textParts []string
 	toolCount := 0
 	waitStart := time.Now()
@@ -1786,7 +1813,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
 					if err := p.Send(e.ctx, replyCtx, chunk); err != nil {
 						slog.Error("failed to send reply", "error", err, "msg_id", msgID)
-						e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", fmt.Sprintf("failed to send reply: %v", err))
+						e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", fmt.Sprintf("failed to send reply: %v", err), measureTurnNetwork(networkStart))
 						return
 					}
 				}
@@ -1807,7 +1834,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
-			e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(turnDuration.Milliseconds()), "success", "")
+			e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(turnDuration.Milliseconds()), "success", "", measureTurnNetwork(networkStart))
 
 			return
 
@@ -1818,7 +1845,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			if event.Error != nil {
 				slog.Error("agent error", "error", event.Error)
-				e.logUsageAsync(msg, agent, inputText, strings.Join(textParts, ""), latestUsage, int(time.Since(turnStart).Milliseconds()), "error", event.Error.Error())
+				e.logUsageAsync(msg, agent, inputText, strings.Join(textParts, ""), latestUsage, int(time.Since(turnStart).Milliseconds()), "error", event.Error.Error(), measureTurnNetwork(networkStart))
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}
 			return
@@ -1847,14 +1874,14 @@ channelClosed:
 			}
 		}
 
-		e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly")
+		e.logUsageAsync(msg, agent, inputText, fullResponse, latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly", measureTurnNetwork(networkStart))
 		return
 	}
 
-	e.logUsageAsync(msg, agent, inputText, "", latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly")
+	e.logUsageAsync(msg, agent, inputText, "", latestUsage, int(time.Since(turnStart).Milliseconds()), "error", "agent process exited unexpectedly", measureTurnNetwork(networkStart))
 }
 
-func (e *Engine) logUsageAsync(msg *Message, agent Agent, inputText, outputText string, usage *UsageMetrics, latencyMs int, status, errorMessage string) {
+func (e *Engine) logUsageAsync(msg *Message, agent Agent, inputText, outputText string, usage *UsageMetrics, latencyMs int, status, errorMessage string, networkUsage NetworkUsage) {
 	if e.authWebhookURL == "" || msg == nil {
 		return
 	}
@@ -1866,9 +1893,13 @@ func (e *Engine) logUsageAsync(msg *Message, agent Agent, inputText, outputText 
 	}
 
 	model := "unknown"
-	if switcher, ok := agent.(interface{ GetModel() string }); ok {
-		if m := switcher.GetModel(); m != "" {
-			model = m
+	if agent == nil {
+		model = "shell"
+	} else {
+		if switcher, ok := agent.(interface{ GetModel() string }); ok {
+			if m := switcher.GetModel(); m != "" {
+				model = m
+			}
 		}
 	}
 
@@ -1894,8 +1925,8 @@ func (e *Engine) logUsageAsync(msg *Message, agent Agent, inputText, outputText 
 		"cost_cents":        costCents,
 		"status":            status,
 		"error_message":     errorMessage,
-		"network_bytes_in":  0,
-		"network_bytes_out": 0,
+		"network_bytes_in":  networkUsage.BytesIn,
+		"network_bytes_out": networkUsage.BytesOut,
 		"compute_seconds":   0,
 	}
 
@@ -4324,6 +4355,20 @@ func (e *Engine) SendToSession(sessionKey, message string) error {
 	}
 
 	if state == nil {
+		if sessionKey == "" {
+			return fmt.Errorf("no active session found (key=%q)", sessionKey)
+		}
+		for _, p := range e.platforms {
+			rc, ok := p.(ReplyContextReconstructor)
+			if !ok {
+				continue
+			}
+			replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
+			if err != nil {
+				continue
+			}
+			return p.Send(e.ctx, replyCtx, message)
+		}
 		return fmt.Errorf("no active session found (key=%q)", sessionKey)
 	}
 
@@ -4337,6 +4382,10 @@ func (e *Engine) SendToSession(sessionKey, message string) error {
 	}
 
 	return p.Send(e.ctx, replyCtx, message)
+}
+
+func (e *Engine) ActiveTurns() int {
+	return int(e.activeTurns.Load())
 }
 
 // sendPermissionPrompt sends a permission prompt with interactive buttons when

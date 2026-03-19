@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -654,16 +655,28 @@ func sessionStorePath(dataDir, name, workDir string) string {
 // applyEnvOverrides applies environment variable overrides to cfg.
 // CC_MANAGED_SERVER_URL replaces cfg.Managed.ServerURL so the cluster-internal
 // base URL comes from a ConfigMap env var rather than the read-only config.toml.
-// auth_webhook is derived from it when not already set in config.
+// When set, auth_webhook is always re-derived from the env URL (overrides
+// config.toml value) so infrastructure URL changes take effect on pod restart.
+//
+// NOTE: This function operates on the global cfg. In multi-project configs,
+// cfg.Managed.ProjectID is a global field — all projects will share one
+// project_id in the derived auth_webhook. This is intentional: the managed K8s
+// Pod model runs exactly one [[projects]] per pod. Multi-project configs are
+// not supported when using CC_MANAGED_SERVER_URL.
 func applyEnvOverrides(cfg *config.Config) {
 	if envURL := os.Getenv("CC_MANAGED_SERVER_URL"); envURL != "" {
 		cfg.Managed.ServerURL = strings.TrimRight(envURL, "/")
 		cfg.Managed.Enabled = true
-	}
-	// Derive auth_webhook from managed server URL + project_id when not
-	// explicitly set in config.toml.
-	if cfg.AuthWebhook == "" && cfg.Managed.ServerURL != "" && cfg.Managed.ProjectID != "" {
-		cfg.AuthWebhook = cfg.Managed.ServerURL + "/api/internal/verify?project_id=" + cfg.Managed.ProjectID
+
+		if len(cfg.Projects) > 1 {
+			slog.Warn("applyEnvOverrides: CC_MANAGED_SERVER_URL is set but config has multiple projects; auth_webhook will use the global managed.project_id for all projects — this is not supported")
+		}
+
+		// Always override auth_webhook from the env URL so changes to the
+		// cluster-internal address take effect without recreating the Secret.
+		if cfg.Managed.ProjectID != "" {
+			cfg.AuthWebhook = cfg.Managed.ServerURL + "/api/internal/verify?project_id=" + url.QueryEscape(cfg.Managed.ProjectID)
+		}
 	}
 }
 

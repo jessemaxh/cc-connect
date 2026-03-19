@@ -15,8 +15,19 @@ var configMu sync.Mutex
 // ConfigPath stores the path to the config file for saving
 var ConfigPath string
 
+// ManagedConfig holds settings for managed (server-orchestrated) deployments.
+// When enabled, cc-connect periodically checks the server for binary updates
+// and self-updates without requiring a pod rebuild.
+type ManagedConfig struct {
+	Enabled       bool   `toml:"enabled"`
+	ServerURL     string `toml:"server_url"`     // base URL of the easyclawbot server, e.g. "http://core-api:8080"
+	ProjectID     string `toml:"project_id"`     // UUID of this project in the server
+	WebhookSecret string `toml:"webhook_secret"` // shared secret for internal API authentication
+}
+
 type Config struct {
 	DataDir     string          `toml:"data_dir"` // session store directory, default ~/.cc-connect
+	Managed     ManagedConfig   `toml:"managed"`
 	Projects    []ProjectConfig `toml:"projects"`
 	Commands    []CommandConfig `toml:"commands"`     // global custom slash commands
 	Aliases     []AliasConfig   `toml:"aliases"`     // global command aliases

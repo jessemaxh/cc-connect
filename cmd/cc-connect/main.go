@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -525,6 +526,19 @@ func main() {
 	}
 
 	slog.Info("cc-connect is running", "projects", len(engines))
+
+	// Start server-managed binary updater when running as a managed pod.
+	updaterCtx, updaterCancel := context.WithCancel(context.Background())
+	defer updaterCancel()
+	if cfg.Managed.Enabled {
+		core.StartServerUpdater(
+			updaterCtx,
+			cfg.Managed.ServerURL,
+			cfg.Managed.ProjectID,
+			cfg.Managed.WebhookSecret,
+			version,
+		)
+	}
 
 	// After startup, check if we were restarted and send success notification
 	if notify := core.ConsumeRestartNotify(cfg.DataDir); notify != nil {

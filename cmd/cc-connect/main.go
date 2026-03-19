@@ -161,9 +161,18 @@ func main() {
 		workDir, _ := proj.Agent.Options["work_dir"].(string)
 		sessionFile := sessionStorePath(cfg.DataDir, proj.Name, workDir)
 
-		// Parse language setting
+		// Parse language setting.
+		// In K8s Pod mode, config.toml is read-only (Secret mount), so a previously
+		// auto-detected language is stored in a project-specific file in DataDir instead.
+		langFilePath := filepath.Join(cfg.DataDir, "lang-"+sanitizeFilename(proj.Name))
+		langStr := cfg.Language
+		if langStr == "" || langStr == "auto" {
+			if saved := config.LoadLanguageFromFile(langFilePath); saved != "" {
+				langStr = saved
+			}
+		}
 		var lang core.Language
-		switch cfg.Language {
+		switch langStr {
 		case "zh", "chinese":
 			lang = core.LangChinese
 		case "zh-TW", "zh_TW", "zhtw":
@@ -409,10 +418,14 @@ func main() {
 			}
 		}
 
-		// Set up save callback for auto-detected language
+		// Set up save callback for auto-detected language.
+		// Use a project-specific file ({dataDir}/lang-{name}) to avoid rewriting the
+		// read-only config.toml Secret mount in K8s Pods, and to isolate projects
+		// that share the same DataDir.
 		if lang == core.LangAuto {
+			capturedLangFilePath := langFilePath
 			engine.SetLanguageSaveFunc(func(l core.Language) error {
-				return config.SaveLanguage(string(l))
+				return config.SaveLanguageToFile(capturedLangFilePath, string(l))
 			})
 		}
 
@@ -635,6 +648,16 @@ func sessionStorePath(dataDir, name, workDir string) string {
 	}
 
 	return filepath.Join(dataDir, "sessions", filename)
+}
+
+// sanitizeFilename replaces characters that are unsafe in filenames with underscores.
+func sanitizeFilename(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
 }
 
 // resolveConfigPath determines which config file to use.

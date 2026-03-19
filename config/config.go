@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/BurntSushi/toml"
@@ -365,6 +366,27 @@ func saveConfig(cfg *Config) error {
 		return err
 	}
 	return os.Rename(tmpPath, ConfigPath)
+}
+
+// SaveLanguageToFile writes the language preference to the given path,
+// avoiding the read-only config.toml mount in K8s Pods.
+// The caller is responsible for choosing a project-specific path to avoid
+// cross-project collisions when multiple projects share the same DataDir.
+func SaveLanguageToFile(path, lang string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("language file: create dir: %w", err)
+	}
+	return os.WriteFile(path, []byte(lang), 0o644)
+}
+
+// LoadLanguageFromFile reads the language preference from the given path.
+// Returns "" if the file does not exist.
+func LoadLanguageFromFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // SaveLanguage saves the language setting to the config file.

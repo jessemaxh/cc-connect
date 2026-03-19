@@ -82,6 +82,12 @@ func (a *Agent) SetModel(model string) {
 func (a *Agent) GetModel() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Mirror StartSession precedence: active provider's model wins over the base model.
+	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
+		if m := a.providers[a.activeIdx].Model; m != "" {
+			return m
+		}
+	}
 	return a.model
 }
 

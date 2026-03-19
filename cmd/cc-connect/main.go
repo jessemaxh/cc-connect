@@ -116,6 +116,7 @@ func main() {
 	}
 
 	config.ConfigPath = configPath
+	applyEnvOverrides(cfg)
 	slog.Info("config loaded", "path", configPath)
 
 	setupLogger(cfg.Log.Level, logWriter)
@@ -650,6 +651,22 @@ func sessionStorePath(dataDir, name, workDir string) string {
 	return filepath.Join(dataDir, "sessions", filename)
 }
 
+// applyEnvOverrides applies environment variable overrides to cfg.
+// CC_MANAGED_SERVER_URL replaces cfg.Managed.ServerURL so the cluster-internal
+// base URL comes from a ConfigMap env var rather than the read-only config.toml.
+// auth_webhook is derived from it when not already set in config.
+func applyEnvOverrides(cfg *config.Config) {
+	if envURL := os.Getenv("CC_MANAGED_SERVER_URL"); envURL != "" {
+		cfg.Managed.ServerURL = strings.TrimRight(envURL, "/")
+		cfg.Managed.Enabled = true
+	}
+	// Derive auth_webhook from managed server URL + project_id when not
+	// explicitly set in config.toml.
+	if cfg.AuthWebhook == "" && cfg.Managed.ServerURL != "" && cfg.Managed.ProjectID != "" {
+		cfg.AuthWebhook = cfg.Managed.ServerURL + "/api/internal/verify?project_id=" + cfg.Managed.ProjectID
+	}
+}
+
 // sanitizeFilename replaces characters that are unsafe in filenames with underscores.
 func sanitizeFilename(s string) string {
 	return strings.Map(func(r rune) rune {
@@ -813,6 +830,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	if err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
+	applyEnvOverrides(cfg)
 
 	result := &core.ConfigReloadResult{}
 

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	updatePollInterval = 5 * time.Minute
+	updatePollInterval = 6 * time.Hour
 	updateCheckTimeout = 15 * time.Second
 	updateDownTimeout  = 5 * time.Minute
 	// maxBinarySize caps the download + decompressed size to prevent zip bombs.

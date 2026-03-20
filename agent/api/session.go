@@ -27,6 +27,7 @@ const (
 type apiSession struct {
 	llm    *llmClient
 	mcp    *mcp.Manager
+	skills *core.SkillEngine
 	model  string
 	system string
 
@@ -52,12 +53,21 @@ func newAPISession(
 	ctx context.Context,
 	llm *llmClient,
 	mcpMgr *mcp.Manager,
+	skills *core.SkillEngine,
 	model, system, sessionID string,
 ) *apiSession {
+	// Append skill prompt section to system prompt.
+	if skills != nil {
+		section := skills.BuildPromptSection()
+		if section != "" {
+			system += section
+		}
+	}
 	sCtx, cancel := context.WithCancel(ctx)
 	s := &apiSession{
 		llm:       llm,
 		mcp:       mcpMgr,
+		skills:    skills,
 		model:     model,
 		system:    system,
 		sessionID: sessionID,
@@ -286,6 +296,16 @@ func (s *apiSession) executeTool(tc toolCall) string {
 			return fmt.Sprintf("error: could not parse arguments: %v", err)
 		}
 	}
+
+	// Check if it's a skill management tool.
+	if s.skills != nil && core.IsSkillTool(tc.Function.Name) {
+		result, err := s.skills.HandleToolCall(s.ctx, tc.Function.Name, args)
+		if err != nil {
+			return fmt.Sprintf("error: %v", err)
+		}
+		return result
+	}
+
 	if s.mcp == nil {
 		return fmt.Sprintf("error: no MCP servers configured, cannot call tool %q", tc.Function.Name)
 	}
@@ -311,25 +331,41 @@ func extractTextParts(content []mcp.ToolContent) []string {
 }
 
 func (s *apiSession) buildToolDefs() []toolDef {
-	if s.mcp == nil {
-		return nil
-	}
-	tools := s.mcp.AllTools()
-	defs := make([]toolDef, 0, len(tools))
-	for _, t := range tools {
-		schema := t.InputSchema
-		if schema == nil {
-			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+	var defs []toolDef
+
+	// MCP tools.
+	if s.mcp != nil {
+		tools := s.mcp.AllTools()
+		for _, t := range tools {
+			schema := t.InputSchema
+			if schema == nil {
+				schema = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			defs = append(defs, toolDef{
+				Type: "function",
+				Function: toolFuncDef{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  schema,
+				},
+			})
 		}
-		defs = append(defs, toolDef{
-			Type: "function",
-			Function: toolFuncDef{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  schema,
-			},
-		})
 	}
+
+	// Skill management tools.
+	if s.skills != nil {
+		for _, st := range s.skills.SkillToolDefs() {
+			defs = append(defs, toolDef{
+				Type: "function",
+				Function: toolFuncDef{
+					Name:        st.Name,
+					Description: st.Description,
+					Parameters:  st.Parameters,
+				},
+			})
+		}
+	}
+
 	return defs
 }
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -38,6 +39,7 @@ type Platform struct {
 	cancel                context.CancelFunc
 	channelNameCache      map[string]string
 	channelCacheMu        sync.RWMutex
+	started               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -88,6 +90,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}
 	}()
 
+	p.started.Store(true)
 	slog.Info("slack: socket mode connected")
 	return nil
 }
@@ -320,8 +323,20 @@ func (p *Platform) ResolveChannelName(channelID string) (string, error) {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("slack: not started")
+	}
+	if p.socket == nil {
+		return fmt.Errorf("slack: socket is nil")
 	}
 	return nil
 }

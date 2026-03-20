@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -58,6 +59,7 @@ type Platform struct {
 	dedup                 core.MessageDedup
 	botOpenID             string
 	userNameCache         sync.Map // open_id -> display name
+	started               atomic.Bool
 }
 
 type interactivePlatform struct {
@@ -187,6 +189,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}
 	}()
 
+	p.started.Store(true)
 	return nil
 }
 
@@ -1436,8 +1439,20 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("%s: not started", p.tag())
+	}
+	if p.wsClient == nil {
+		return fmt.Errorf("%s: wsClient is nil", p.tag())
 	}
 	return nil
 }

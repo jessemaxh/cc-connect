@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -32,6 +33,7 @@ type Platform struct {
 	streamClient          *dingtalkClient.StreamClient
 	handler               core.MessageHandler
 	dedup                 core.MessageDedup
+	started               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -81,6 +83,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	case <-time.After(3 * time.Second):
 	}
 
+	p.started.Store(true)
 	slog.Info("dingtalk: stream connected", "client_id", p.clientID)
 	return nil
 }
@@ -167,8 +170,20 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.streamClient != nil {
 		p.streamClient.Close()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("dingtalk: not started")
+	}
+	if p.streamClient == nil {
+		return fmt.Errorf("dingtalk: streamClient is nil")
 	}
 	return nil
 }

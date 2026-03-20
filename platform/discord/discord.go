@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -47,6 +48,7 @@ type Platform struct {
 	botID                 string
 	appID                 string
 	readyCh               chan struct{}
+	started               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -248,6 +250,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		return fmt.Errorf("discord: open gateway: %w", err)
 	}
 
+	p.started.Store(true)
 	return nil
 }
 
@@ -509,8 +512,20 @@ func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.session != nil {
 		return p.session.Close()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("discord: not started")
+	}
+	if p.session == nil {
+		return fmt.Errorf("discord: session is nil")
 	}
 	return nil
 }

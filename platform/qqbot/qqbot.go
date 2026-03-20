@@ -79,6 +79,8 @@ type Platform struct {
 	// msg_seq counter per event msg_id (for multiple replies to same event)
 	msgSeqMu  sync.Mutex
 	msgSeqMap map[string]*msgSeqEntry
+
+	started atomic.Bool
 }
 
 // msgSeqEntry tracks msg_seq counter with a creation timestamp for TTL eviction.
@@ -147,6 +149,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		return fmt.Errorf("qqbot: failed to connect gateway: %w", err)
 	}
 
+	p.started.Store(true)
 	slog.Info("qqbot: connected to QQ Bot gateway", "sandbox", p.sandbox)
 	return nil
 }
@@ -174,6 +177,7 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 
 // Stop shuts down the platform.
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -181,6 +185,20 @@ func (p *Platform) Stop() error {
 	defer p.wsMu.Unlock()
 	if p.wsConn != nil {
 		return p.wsConn.Close()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("qqbot: not started")
+	}
+	p.wsMu.Lock()
+	conn := p.wsConn
+	p.wsMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("qqbot: WebSocket connection is nil")
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -36,6 +37,7 @@ type Platform struct {
 	bot           *messaging_api.MessagingApiAPI
 	server        *http.Server
 	handler       core.MessageHandler
+	started       atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -91,6 +93,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}
 	}()
 
+	p.started.Store(true)
 	return nil
 }
 
@@ -270,8 +273,20 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.server != nil {
 		return p.server.Shutdown(context.Background())
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("line: not started")
+	}
+	if p.bot == nil {
+		return fmt.Errorf("line: bot is nil")
 	}
 	return nil
 }

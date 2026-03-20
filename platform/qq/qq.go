@@ -37,6 +37,7 @@ type Platform struct {
 	cancel                context.CancelFunc
 	selfID                int64
 	dedup                 core.MessageDedup
+	started               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -89,6 +90,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	go p.readLoop(ctx)
 
+	p.started.Store(true)
 	return nil
 }
 
@@ -331,11 +333,23 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
 	}
 	if p.conn != nil {
 		return p.conn.Close()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("qq: not started")
+	}
+	if p.conn == nil {
+		return fmt.Errorf("qq: WebSocket connection is nil")
 	}
 	return nil
 }

@@ -36,6 +36,7 @@ type WSPlatform struct {
 	reqSeq    atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map   // req_id -> chan error, for sequential send with ack waiting
+	started     atomic.Bool
 }
 
 const wsAckTimeout = 5 * time.Second
@@ -112,6 +113,7 @@ func (p *WSPlatform) Start(handler core.MessageHandler) error {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	go p.connectLoop()
+	p.started.Store(true)
 	return nil
 }
 
@@ -451,6 +453,7 @@ func (p *WSPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func (p *WSPlatform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -459,6 +462,20 @@ func (p *WSPlatform) Stop() error {
 	p.mu.Unlock()
 	if conn != nil {
 		return conn.Close()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *WSPlatform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("wecom-ws: not started")
+	}
+	p.mu.Lock()
+	conn := p.conn
+	p.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("wecom-ws: WebSocket connection is nil")
 	}
 	return nil
 }

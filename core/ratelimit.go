@@ -13,6 +13,8 @@ type RateLimiter struct {
 	buckets     map[string]*rateBucket
 	maxMessages int
 	windowMs    int64
+	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 type rateBucket struct {
@@ -27,11 +29,18 @@ func NewRateLimiter(maxMessages int, window time.Duration) *RateLimiter {
 		buckets:     make(map[string]*rateBucket),
 		maxMessages: maxMessages,
 		windowMs:    window.Milliseconds(),
+		stopCh:      make(chan struct{}),
 	}
 	if maxMessages > 0 {
 		go rl.cleanupLoop()
 	}
 	return rl
+}
+
+// Stop terminates the background cleanup goroutine.
+// Safe to call concurrently and multiple times.
+func (rl *RateLimiter) Stop() {
+	rl.stopOnce.Do(func() { close(rl.stopCh) })
 }
 
 // Allow checks whether a message from the given key is within the rate limit.
@@ -71,15 +80,20 @@ func (rl *RateLimiter) Allow(key string) bool {
 func (rl *RateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now().UnixMilli()
-		staleThreshold := rl.windowMs * 2
-		for k, b := range rl.buckets {
-			if now-b.lastAccess > staleThreshold {
-				delete(rl.buckets, k)
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now().UnixMilli()
+			staleThreshold := rl.windowMs * 2
+			for k, b := range rl.buckets {
+				if now-b.lastAccess > staleThreshold {
+					delete(rl.buckets, k)
+				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }

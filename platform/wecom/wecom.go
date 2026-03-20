@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -75,6 +76,7 @@ type Platform struct {
 	apiClient      *http.Client // HTTP client for outbound API calls (may use proxy)
 	tokenCache     tokenCache
 	dedup          msgDedup
+	started        atomic.Bool
 }
 
 // msgDedup tracks recently processed MsgIds to avoid WeChat Work retry duplicates.
@@ -198,6 +200,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}
 	}()
 
+	p.started.Store(true)
 	return nil
 }
 
@@ -502,8 +505,17 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.server != nil {
 		return p.server.Shutdown(context.Background())
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("wecom: not started")
 	}
 	return nil
 }

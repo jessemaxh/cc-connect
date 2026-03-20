@@ -31,8 +31,10 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -47,12 +49,14 @@ func init() {
 type Agent struct {
 	llm    *llmClient
 	mcpMgr *mcp.Manager
+	skills *core.SkillEngine
 
 	mu        sync.Mutex
 	model     string
 	system    string
 	providers []core.ProviderConfig
 	activeIdx int
+	started   atomic.Bool
 }
 
 // New creates a new api Agent from options map.
@@ -83,6 +87,20 @@ func New(opts map[string]any) (core.Agent, error) {
 		}
 	}
 
+	// Initialize SkillEngine if server URL and project ID are configured.
+	serverURL, _ := opts["server_url"].(string)
+	projectID, _ := opts["project_id"].(string)
+	webhookSecret, _ := opts["webhook_secret"].(string)
+	if serverURL != "" && projectID != "" {
+		a.skills = core.NewSkillEngine(a.mcpMgr, serverURL, projectID, webhookSecret)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := a.skills.Load(ctx); err != nil {
+			slog.Warn("api agent: skill engine load failed", "error", err)
+		}
+		cancel()
+	}
+
+	a.started.Store(true)
 	return a, nil
 }
 
@@ -155,7 +173,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newAPISession(ctx, llm, a.mcpMgr, model, system, sessionID), nil
+	return newAPISession(ctx, llm, a.mcpMgr, a.skills, model, system, sessionID), nil
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -163,7 +181,25 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 }
 
 func (a *Agent) Stop() error {
+	a.started.Store(false)
 	a.mcpMgr.Close()
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (a *Agent) HealthCheck() error {
+	if !a.started.Load() {
+		return fmt.Errorf("api agent: not started")
+	}
+	if a.llm == nil {
+		return fmt.Errorf("api agent: llm client is nil")
+	}
+	a.mu.Lock()
+	model := a.model
+	a.mu.Unlock()
+	if model == "" {
+		return fmt.Errorf("api agent: model is empty")
+	}
 	return nil
 }
 
@@ -267,3 +303,4 @@ func (a *Agent) HasSystemPromptSupport() bool { return true }
 var _ core.ModelSwitcher = (*Agent)(nil)
 var _ core.ProviderSwitcher = (*Agent)(nil)
 var _ core.SystemPromptSupporter = (*Agent)(nil)
+var _ core.HealthChecker = (*Agent)(nil)

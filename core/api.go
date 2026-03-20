@@ -22,6 +22,7 @@ type APIServer struct {
 	engines    map[string]*Engine // project name → engine
 	cron       *CronScheduler
 	relay      *RelayManager
+	allowExec  bool // whether cron shell exec jobs are permitted
 	mu         sync.RWMutex
 }
 
@@ -68,6 +69,11 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	return s, nil
 }
 
+// SetAllowExec controls whether cron shell exec jobs are permitted.
+func (s *APIServer) SetAllowExec(allow bool) {
+	s.allowExec = allow
+}
+
 func (s *APIServer) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -78,13 +84,16 @@ func (s *APIServer) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) 
 	defer s.mu.RUnlock()
 
 	activeTurns := 0
+	var checks []HealthCheck
 	for _, e := range s.engines {
 		activeTurns += e.ActiveTurns()
+		checks = append(checks, e.HealthChecks()...)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]int{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"active_turns": activeTurns,
+		"checks":       checks,
 	})
 }
 
@@ -242,6 +251,10 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Prompt != "" && req.Exec != "" {
 		http.Error(w, "prompt and exec are mutually exclusive", http.StatusBadRequest)
+		return
+	}
+	if req.Exec != "" && !s.allowExec {
+		http.Error(w, "shell exec cron jobs are disabled (set cron.allow_exec = true to enable)", http.StatusForbidden)
 		return
 	}
 

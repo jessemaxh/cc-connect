@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -35,6 +36,7 @@ type Platform struct {
 	httpClient            *http.Client
 	handler               core.MessageHandler
 	cancel                context.CancelFunc
+	started               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -89,6 +91,8 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+
+	p.started.Store(true)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 30
@@ -705,11 +709,23 @@ func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 }
 
 func (p *Platform) Stop() error {
+	p.started.Store(false)
 	if p.cancel != nil {
 		p.cancel()
 	}
 	if p.bot != nil {
 		p.bot.StopReceivingUpdates()
+	}
+	return nil
+}
+
+// HealthCheck implements core.HealthChecker.
+func (p *Platform) HealthCheck() error {
+	if !p.started.Load() {
+		return fmt.Errorf("telegram: not started")
+	}
+	if p.bot == nil {
+		return fmt.Errorf("telegram: bot is nil")
 	}
 	return nil
 }

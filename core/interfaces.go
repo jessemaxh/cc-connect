@@ -323,3 +323,10 @@ type CommandRegistrar interface {
 type ChannelNameResolver interface {
 	ResolveChannelName(channelID string) (string, error)
 }
+
+// HealthChecker is an optional interface for platforms and agents
+// to report their connection/readiness status.
+// Return nil if healthy, or a non-nil error describing the problem.
+type HealthChecker interface {
+	HealthCheck() error
+}

@@ -17,12 +17,13 @@ import (
 // WebhookServer exposes an HTTP endpoint for external systems
 // (git hooks, CI/CD, file watchers, etc.) to trigger agent or shell actions.
 type WebhookServer struct {
-	port    int
-	token   string
-	path    string
-	server  *http.Server
-	engines map[string]*Engine
-	mu      sync.RWMutex
+	port      int
+	token     string
+	path      string
+	server    *http.Server
+	engines   map[string]*Engine
+	allowExec bool
+	mu        sync.RWMutex
 }
 
 // WebhookRequest is the JSON body for POST /hook.
@@ -53,6 +54,10 @@ func NewWebhookServer(port int, token, path string) *WebhookServer {
 		path:    path,
 		engines: make(map[string]*Engine),
 	}
+}
+
+func (ws *WebhookServer) SetAllowExec(allow bool) {
+	ws.allowExec = allow
 }
 
 func (ws *WebhookServer) RegisterEngine(name string, e *Engine) {
@@ -111,6 +116,10 @@ func (ws *WebhookServer) handleHook(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Prompt != "" && req.Exec != "" {
 		http.Error(w, "prompt and exec are mutually exclusive", http.StatusBadRequest)
+		return
+	}
+	if req.Exec != "" && !ws.allowExec {
+		http.Error(w, "shell exec is disabled (set cron.allow_exec = true to enable)", http.StatusForbidden)
 		return
 	}
 

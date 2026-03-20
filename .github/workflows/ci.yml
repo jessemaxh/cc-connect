@@ -46,3 +46,17 @@ jobs:
         with:
           files: ./coverage.out
           fail_ci_if_error: false
+
+  # After CI passes on main, trigger server to update the cc-connect submodule pointer.
+  update-server-submodule:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Trigger server submodule update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SERVER_REPO_TOKEN }}
+          repository: jessemaxh/easyclawbotServer
+          event-type: cc-connect-updated
+          client-payload: '{"sha": "${{ github.sha }}", "ref": "${{ github.ref }}"}'

@@ -490,7 +490,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	session.SetAgentInfo(matched.ID, matched.Summary)
+	session.SetAgentInfo(matched.ID, e.agent.Name(), matched.Summary)
 	session.ClearHistory()
 	sessions.Save()
 
@@ -2468,7 +2468,10 @@ func drainEvents(ch <-chan Event) {
 	drained := 0
 	for {
 		select {
-		case <-ch:
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
 			drained++
 		default:
 			if drained > 0 {
@@ -2771,7 +2774,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		session := sessions.GetOrCreateActive(sessionKey)
-		session.SetAgentInfo(matched.ID, matched.Summary)
+		session.SetAgentInfo(matched.ID, e.agent.Name(), matched.Summary)
 		session.ClearHistory()
 		sessions.Save()
 
@@ -3799,7 +3802,7 @@ func (e *Engine) cmdCron(p Platform, msg *Message, args []string) {
 	}
 
 	sub := matchSubCommand(strings.ToLower(args[0]), []string{
-		"add", "addexec", "list", "del", "delete", "rm", "remove", "enable", "disable",
+		"add", "addexec", "list", "del", "delete", "rm", "remove", "enable", "disable", "setup",
 	})
 	switch sub {
 	case "add":
@@ -3814,6 +3817,8 @@ func (e *Engine) cmdCron(p Platform, msg *Message, args []string) {
 		e.cmdCronToggle(p, msg, args[1:], true)
 	case "disable":
 		e.cmdCronToggle(p, msg, args[1:], false)
+	case "setup":
+		e.cmdCronSetup(p, msg)
 	default:
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronUsage))
 	}
@@ -3948,6 +3953,22 @@ func (e *Engine) cmdCronDel(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronDeleted), id))
 	} else {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronNotFound), id))
+	}
+}
+
+func (e *Engine) cmdCronSetup(p Platform, msg *Message) {
+	result, baseName, err := e.setupMemoryFile()
+	switch result {
+	case setupNative:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSetupNative))
+	case setupNoMemory:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRelaySetupNoMemory))
+	case setupExists:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), baseName))
+	case setupError:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
+	case setupOK:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronSetupOK), baseName))
 	}
 }
 
@@ -5120,7 +5141,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	}
 	defer agentSession.Close()
 
-	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID()) {
+	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID(), e.agent.Name()) {
 		e.sessions.Save()
 	}
 
@@ -5139,13 +5160,13 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 				textParts = append(textParts, event.Content)
 			}
 			if event.SessionID != "" {
-				if session.CompareAndSetAgentSessionID(event.SessionID) {
+				if session.CompareAndSetAgentSessionID(event.SessionID, e.agent.Name()) {
 					e.sessions.Save()
 				}
 			}
 		case EventResult:
 			if event.SessionID != "" {
-				session.SetAgentSessionID(event.SessionID)
+				session.SetAgentSessionID(event.SessionID, e.agent.Name())
 				e.sessions.Save()
 			}
 			resp := event.Content
@@ -5292,42 +5313,60 @@ func (e *Engine) cmdBindStatus(p Platform, replyCtx any, chatID string) {
 	e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgRelayBound), strings.Join(parts, " ↔ ")))
 }
 
-func (e *Engine) cmdBindSetup(p Platform, msg *Message) {
+type setupResult int
+
+const (
+	setupOK       setupResult = iota
+	setupExists
+	setupNative
+	setupNoMemory
+	setupError
+)
+
+func (e *Engine) setupMemoryFile() (setupResult, string, error) {
+	if _, ok := e.agent.(SystemPromptSupporter); ok {
+		return setupNative, "", nil
+	}
 	mp, ok := e.agent.(MemoryFileProvider)
 	if !ok {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRelaySetupNoMemory))
-		return
+		return setupNoMemory, "", nil
 	}
-
 	filePath := mp.ProjectMemoryFile()
 	if filePath == "" {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRelaySetupNoMemory))
-		return
+		return setupNoMemory, "", nil
 	}
-
+	baseName := filepath.Base(filePath)
 	existing, _ := os.ReadFile(filePath)
 	if strings.Contains(string(existing), ccConnectInstructionMarker) {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), filepath.Base(filePath)))
-		return
+		return setupExists, baseName, nil
 	}
-
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-		return
+		return setupError, baseName, err
 	}
-
 	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-		return
+		return setupError, baseName, err
 	}
 	defer f.Close()
-
 	block := "\n" + ccConnectInstructionMarker + "\n" + AgentSystemPrompt() + "\n"
 	if _, err := f.WriteString(block); err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-		return
+		return setupError, baseName, err
 	}
+	return setupOK, baseName, nil
+}
 
-	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupOK), filepath.Base(filePath)))
+func (e *Engine) cmdBindSetup(p Platform, msg *Message) {
+	result, baseName, err := e.setupMemoryFile()
+	switch result {
+	case setupNative:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSetupNative))
+	case setupNoMemory:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRelaySetupNoMemory))
+	case setupExists:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), baseName))
+	case setupError:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
+	case setupOK:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupOK), baseName))
+	}
 }

@@ -210,6 +210,10 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		eventIdleTimeout:  defaultEventIdleTimeout,
 	}
 
+	if ag != nil {
+		e.sessions.InvalidateForAgent(ag.Name())
+	}
+
 	if cp, ok := ag.(CommandProvider); ok {
 		e.commands.SetAgentDirs(cp.CommandDirs())
 	}
@@ -310,6 +314,13 @@ func (e *Engine) SetProviderAddSaveFunc(fn func(ProviderConfig) error) {
 
 func (e *Engine) SetProviderRemoveSaveFunc(fn func(string) error) {
 	e.providerRemoveSaveFunc = fn
+}
+
+// AddPlatform appends a platform to the engine after construction.
+// The platform is started and wired during the next Engine.Start call,
+// or if the engine is already running, it is started immediately.
+func (e *Engine) AddPlatform(p Platform) {
+	e.platforms = append(e.platforms, p)
 }
 
 func (e *Engine) SetCronScheduler(cs *CronScheduler) {
@@ -445,6 +456,7 @@ func (e *Engine) SetBannedWords(words []string) {
 }
 
 // SetRateLimitCfg configures per-session message rate limiting.
+// It stops the previous rate limiter's background goroutine before replacing it.
 func (e *Engine) SetRateLimitCfg(cfg RateLimitCfg) {
 	if e.rateLimiter != nil {
 		e.rateLimiter.Stop()
@@ -483,6 +495,19 @@ func (e *Engine) RemoveCommand(name string) bool {
 
 func (e *Engine) ProjectName() string {
 	return e.name
+}
+
+// ActiveSessionKeys returns the session keys of all active interactive sessions.
+func (e *Engine) ActiveSessionKeys() []string {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	var keys []string
+	for key, state := range e.interactiveStates {
+		if state.platform != nil {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func (e *Engine) Start() error {
@@ -604,6 +629,10 @@ func (e *Engine) Stop() error {
 			slog.Debug("engine.Stop: closing agent session", "session", key)
 			state.agentSession.Close()
 		}
+	}
+
+	if e.rateLimiter != nil {
+		e.rateLimiter.Stop()
 	}
 
 	if err := e.agent.Stop(); err != nil {

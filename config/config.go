@@ -43,6 +43,8 @@ type Config struct {
 	Quiet            *bool               `toml:"quiet,omitempty"`              // global default for quiet mode; project-level overrides this
 	Cron             CronConfig          `toml:"cron"`
 	Webhook          WebhookConfig       `toml:"webhook"`
+	Bridge           BridgeConfig        `toml:"bridge"`
+	Management       ManagementConfig    `toml:"management"`
 	AuthWebhook       string              `toml:"auth_webhook"`                  // URL for message authentication webhook
 	AuthWebhookSecret string              `toml:"auth_webhook_secret"`           // shared secret for webhook auth
 	IdleTimeoutMins  *int                `toml:"idle_timeout_mins,omitempty"`  // max minutes between agent events; 0 = no timeout; default 120
@@ -59,6 +61,22 @@ type WebhookConfig struct {
 	Port    int    `toml:"port,omitempty"`     // listen port; default 9111
 	Token   string `toml:"token,omitempty"`    // shared secret for authentication; empty = no auth
 	Path    string `toml:"path,omitempty"`     // URL path prefix; default "/hook"
+}
+
+// BridgeConfig controls the WebSocket bridge for external platform adapters.
+type BridgeConfig struct {
+	Enabled *bool  `toml:"enabled"`        // default false
+	Port    int    `toml:"port,omitempty"`  // listen port; default 9810
+	Token   string `toml:"token,omitempty"` // shared secret for authentication; required
+	Path    string `toml:"path,omitempty"`  // URL path; default "/bridge/ws"
+}
+
+// ManagementConfig controls the HTTP Management API for external tools.
+type ManagementConfig struct {
+	Enabled     *bool    `toml:"enabled"`                  // default false
+	Port        int      `toml:"port,omitempty"`           // listen port; default 9820
+	Token       string   `toml:"token,omitempty"`          // shared secret for authentication; required
+	CORSOrigins []string `toml:"cors_origins,omitempty"`   // allowed CORS origins; empty = no CORS
 }
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
@@ -106,7 +124,7 @@ type SpeechConfig struct {
 // TTSConfig configures text-to-speech output (mirrors SpeechConfig style).
 type TTSConfig struct {
 	Enabled     bool   `toml:"enabled"`
-	Provider    string `toml:"provider"`     // "qwen" | "openai"
+	Provider    string `toml:"provider"`     // "qwen" | "openai" | "minimax"
 	Voice       string `toml:"voice"`        // default voice name
 	TTSMode     string `toml:"tts_mode"`     // "voice_only" (default) | "always"
 	MaxTextLen  int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
@@ -120,6 +138,11 @@ type TTSConfig struct {
 		BaseURL string `toml:"base_url"`
 		Model   string `toml:"model"`
 	} `toml:"qwen"`
+	MiniMax struct {
+		APIKey  string `toml:"api_key"`
+		BaseURL string `toml:"base_url"`
+		Model   string `toml:"model"`
+	} `toml:"minimax"`
 }
 
 // HeartbeatConfig controls periodic heartbeat for a project.

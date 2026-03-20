@@ -920,7 +920,7 @@ func TestCmdCurrent_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 	session.Name = "Focus"
-	session.AgentSessionID = "session-123"
+	session.SetAgentSessionID("session-123", "test")
 	session.History = append(session.History, HistoryEntry{Role: "user", Content: "hello", Timestamp: time.Now()})
 
 	e.cmdCurrent(p, msg)
@@ -1255,7 +1255,7 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 	}}}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
-	e.sessions.GetOrCreateActive(msg.SessionKey).AgentSessionID = "session-1"
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1", "test")
 
 	e.cmdDelete(p, msg, nil)
 	_ = e.handleCardNav("act:/delete-mode toggle session-1", msg.SessionKey)
@@ -1279,7 +1279,7 @@ func TestDeleteMode_ActiveSessionMarkedWithArrowAndNotSelectable(t *testing.T) {
 	}}}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
-	e.sessions.GetOrCreateActive(msg.SessionKey).AgentSessionID = "session-1"
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1", "test")
 
 	e.cmdDelete(p, msg, nil)
 	if len(p.repliedCards) != 1 {
@@ -1454,7 +1454,7 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = "existing-session"
+	s.SetAgentSessionID("existing-session", "test")
 	s.AddHistory("user", "hello")
 
 	e.cmdReasoning(p, msg, []string{"3"})
@@ -1462,8 +1462,8 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	if agent.reasoningEffort != "high" {
 		t.Fatalf("reasoning effort = %q, want high", agent.reasoningEffort)
 	}
-	if s.AgentSessionID != "" {
-		t.Fatalf("AgentSessionID = %q, want cleared", s.AgentSessionID)
+	if s.GetAgentSessionID() != "" {
+		t.Fatalf("AgentSessionID = %q, want cleared", s.GetAgentSessionID())
 	}
 	if len(s.History) != 0 {
 		t.Fatalf("history length = %d, want 0", len(s.History))
@@ -1781,7 +1781,7 @@ func TestRenderListCard_MakesEveryVisibleSessionClickable(t *testing.T) {
 	}
 
 	e := NewEngine("test", &stubListAgent{sessions: sessions}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
-	e.sessions.GetOrCreateActive("test:user1").AgentSessionID = sessions[5].ID
+	e.sessions.GetOrCreateActive("test:user1").SetAgentSessionID(sessions[5].ID, "test")
 
 	card, err := e.renderListCard("test:user1", 1)
 	if err != nil {
@@ -2433,9 +2433,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
 
 	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
 
-	session.mu.Lock()
-	got := session.AgentSessionID
-	session.mu.Unlock()
+	got := session.GetAgentSessionID()
 
 	if got != "agent-uuid-123" {
 		t.Fatalf("AgentSessionID = %q, want %q — immediate writeback not working", got, "agent-uuid-123")
@@ -2455,9 +2453,7 @@ func TestSessionIDWriteback_DoesNotOverwriteExisting(t *testing.T) {
 
 	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
 
-	session.mu.Lock()
-	got := session.AgentSessionID
-	session.mu.Unlock()
+	got := session.GetAgentSessionID()
 
 	if got != "existing-uuid" {
 		t.Fatalf("AgentSessionID = %q, want %q — writeback should not overwrite", got, "existing-uuid")
@@ -2687,5 +2683,202 @@ func TestExecuteCronShellLogsUsage(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for usage log")
+	}
+}
+
+// ── setupMemoryFile / /cron setup / /bind setup ──────────────
+
+type stubMemoryAgent struct {
+	stubAgent
+	memFile string
+}
+
+func (a *stubMemoryAgent) ProjectMemoryFile() string { return a.memFile }
+func (a *stubMemoryAgent) GlobalMemoryFile() string  { return "" }
+
+type stubNativePromptAgent struct {
+	stubAgent
+}
+
+func (a *stubNativePromptAgent) HasSystemPromptSupport() bool { return true }
+
+func TestSetupMemoryFile_WritesInstructions(t *testing.T) {
+	tmpDir := t.TempDir()
+	memFile := filepath.Join(tmpDir, "AGENTS.md")
+
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubMemoryAgent{memFile: memFile}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	result, baseName, err := e.setupMemoryFile()
+	if result != setupOK {
+		t.Fatalf("result = %d, want setupOK; err = %v", result, err)
+	}
+	if baseName != "AGENTS.md" {
+		t.Errorf("baseName = %q, want AGENTS.md", baseName)
+	}
+
+	content, _ := os.ReadFile(memFile)
+	if !strings.Contains(string(content), ccConnectInstructionMarker) {
+		t.Error("expected instruction marker in file")
+	}
+	if !strings.Contains(string(content), "cc-connect cron add") {
+		t.Error("expected cron instructions in file")
+	}
+}
+
+func TestSetupMemoryFile_Idempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	memFile := filepath.Join(tmpDir, "AGENTS.md")
+
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubMemoryAgent{memFile: memFile}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	r1, _, _ := e.setupMemoryFile()
+	if r1 != setupOK {
+		t.Fatalf("first call: result = %d, want setupOK", r1)
+	}
+
+	r2, _, _ := e.setupMemoryFile()
+	if r2 != setupExists {
+		t.Fatalf("second call: result = %d, want setupExists", r2)
+	}
+}
+
+func TestSetupMemoryFile_NativeAgent(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubNativePromptAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	result, _, _ := e.setupMemoryFile()
+	if result != setupNative {
+		t.Fatalf("result = %d, want setupNative", result)
+	}
+}
+
+func TestSetupMemoryFile_NoMemorySupport(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	result, _, _ := e.setupMemoryFile()
+	if result != setupNoMemory {
+		t.Fatalf("result = %d, want setupNoMemory", result)
+	}
+}
+
+func TestCmdCronSetup_WritesAndReplies(t *testing.T) {
+	tmpDir := t.TempDir()
+	memFile := filepath.Join(tmpDir, "AGENTS.md")
+
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubMemoryAgent{memFile: memFile}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.cronScheduler = &CronScheduler{}
+
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	e.cmdCron(p, msg, []string{"setup"})
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "AGENTS.md") {
+		t.Errorf("reply = %q, want to contain filename", p.sent[0])
+	}
+	if !strings.Contains(p.sent[0], "natural language") {
+		t.Errorf("reply = %q, want cron-specific success message", p.sent[0])
+	}
+
+	content, _ := os.ReadFile(memFile)
+	if !strings.Contains(string(content), ccConnectInstructionMarker) {
+		t.Error("expected instructions written to file")
+	}
+}
+
+func TestCmdCronSetup_NativeAgentSkips(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubNativePromptAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.cronScheduler = &CronScheduler{}
+
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	e.cmdCron(p, msg, []string{"setup"})
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "natively supports") {
+		t.Errorf("reply = %q, want native support message", p.sent[0])
+	}
+}
+
+func TestCmdBindSetup_UsesSharedLogic(t *testing.T) {
+	tmpDir := t.TempDir()
+	memFile := filepath.Join(tmpDir, "AGENTS.md")
+
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubMemoryAgent{memFile: memFile}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	e.cmdBindSetup(p, msg)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "AGENTS.md") {
+		t.Errorf("reply = %q, want to contain filename", p.sent[0])
+	}
+
+	content, _ := os.ReadFile(memFile)
+	if !strings.Contains(string(content), ccConnectInstructionMarker) {
+		t.Error("expected instructions written to file")
+	}
+}
+
+func TestDrainEventsClosedChannel(t *testing.T) {
+	ch := make(chan Event, 2)
+	ch <- Event{Type: EventToolUse, Content: "a"}
+	ch <- Event{Type: EventToolUse, Content: "b"}
+	close(ch)
+
+	done := make(chan struct{})
+	go func() {
+		drainEvents(ch)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok — returned promptly
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainEvents did not return on closed channel (infinite loop)")
+	}
+}
+
+func TestDrainEventsOpenChannel(t *testing.T) {
+	ch := make(chan Event, 3)
+	ch <- Event{Type: EventToolUse, Content: "a"}
+	ch <- Event{Type: EventToolUse, Content: "b"}
+
+	done := make(chan struct{})
+	go func() {
+		drainEvents(ch)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainEvents did not return on open channel with buffered events")
+	}
+
+	// Channel should now be empty.
+	select {
+	case <-ch:
+		t.Fatal("expected channel to be drained")
+	default:
 	}
 }

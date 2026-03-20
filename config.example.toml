@@ -122,6 +122,36 @@ level = "info" # debug, info, warn, error
 #   #   -d "{\"session_key\":\"telegram:123:123\",\"event\":\"git:commit\",\"prompt\":\"New commit: $MSG. Review it briefly.\"}"
 
 # =============================================================================
+# Bridge Platform (External Adapters via WebSocket)
+# Bridge 平台（通过 WebSocket 接入外部适配器）
+# =============================================================================
+# Allow external adapters written in any language to connect at runtime.
+# 允许使用任何语言编写的外部适配器在运行时动态接入。
+# See docs/bridge-protocol.md for the full protocol specification.
+# 完整协议规范请参阅 docs/bridge-protocol.md。
+#
+# [bridge]
+# enabled = true
+# port = 9810                         # WebSocket listen port (default: 9810) / 监听端口
+# token = "your-bridge-secret"        # Auth token (required) / 认证密钥（必填）
+# path = "/bridge/ws"                 # URL path (default: "/bridge/ws") / URL 路径
+
+# =============================================================================
+# Management API (External Management Tools)
+# 管理 API（外部管理工具）
+# =============================================================================
+# HTTP REST API for external apps (web dashboards, TUI, GUI, Mac tray apps).
+# 为外部应用（Web 管理面板、TUI、GUI、Mac 托盘应用）提供 HTTP REST API。
+# See docs/management-api.md for the full API specification.
+# 完整 API 规范请参阅 docs/management-api.md。
+#
+# [management]
+# enabled = true
+# port = 9820                           # HTTP listen port (default: 9820) / 监听端口
+# token = "your-mgmt-secret"            # Auth token (required) / 认证密钥（必填）
+# cors_origins = ["http://localhost:3000"]  # Allowed CORS origins / 允许的 CORS 来源
+
+# =============================================================================
 # Speech-to-Text (Voice Messages) / 语音转文字（语音消息）
 # =============================================================================
 # Enable to transcribe voice messages to text before sending to agents.
@@ -166,7 +196,7 @@ level = "info" # debug, info, warn, error
 
 # [tts]
 # enabled  = true
-# provider = "qwen"          # "qwen" | "openai"
+# provider = "qwen"          # "qwen" | "openai" | "minimax"
 # voice    = "Cherry"        # default voice / 默认音色（千问支持：Cherry/Serena/Ethan/Chelsie 等）
 # tts_mode = "voice_only"    # "voice_only" (default) | "always"
 # max_text_len = 0           # max rune count before skipping TTS; 0 = no limit
@@ -186,6 +216,14 @@ level = "info" # debug, info, warn, error
 # api_key  = "sk-xxx"
 # base_url = ""              # optional: custom endpoint / 可选：自定义端点
 # model    = "tts-1"         # "tts-1" | "tts-1-hd"
+#
+# # Alternative: MiniMax TTS (T2A v2 streaming API)
+# # 备选：MiniMax TTS（T2A v2 流式 API）
+# # Docs: https://platform.minimaxi.com/document/T2A%20V2
+# [tts.minimax]
+# api_key  = "your-minimax-api-key"
+# base_url = ""              # optional: default "https://api.minimax.io" / 留空使用默认地址
+# model    = "speech-2.8-hd" # "speech-2.8-hd" | "speech-2.8"
 
 # =============================================================================
 # Daemon Mode / 守护进程模式
@@ -415,6 +453,7 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "bypassPermission
 # - "acceptEdits" (edit): File edit tools auto-approved; other tools still ask. / 文件编辑自动通过，其他仍需确认。
 # - "plan":               Claude only plans — no execution until you approve. / 只做规划不执行，审批后再执行。
 # - "bypassPermissions" (yolo): All tool calls auto-approved. Use with caution. / 全部自动通过，请谨慎使用。
+# - "dontAsk" (dont-ask): Auto-deny tools unless pre-approved via allowed_tools or settings allow rules. / 未预授权的工具自动拒绝，安全推荐。
 #
 # When using IM platforms, you can reply "允许"/"allow" to grant permission.
 # 在 IM 平台中，可回复"允许"或"allow"来授权操作。
@@ -473,6 +512,17 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "bypassPermission
 # model = "deepseek-ai/DeepSeek-V3"
 # thinking = "disabled"
 #
+# # MiniMax — OpenAI-compatible provider with 204K context window
+# # MiniMax — 兼容 OpenAI 接口的大模型，支持 204K 超长上下文
+# # Models: MiniMax-M2.5 (flagship), MiniMax-M2.5-highspeed (faster)
+# # Docs: https://platform.minimaxi.com
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
+# thinking = "disabled"
+#
 # # For special setups (Bedrock, Vertex, etc.), use the env map:
 # # 特殊环境（Bedrock、Vertex 等）使用 env 字段：
 # [[projects.agent.providers]]
@@ -503,6 +553,8 @@ app_secret = "your-feishu-app-secret"
 #                           # 设为 true 时，群聊中无需 @机器人 也会响应所有消息（默认 false）
 # share_session_in_channel = false  # If true, all users in a group share one agent session
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
+# thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session)
+#                           # 设为 true 时，群聊按飞书话题/根消息隔离会话（一个 thread/root 对应一个 Agent 会话）
 # reply_in_thread = false  # If true, all responses are threaded to the original message (helps trace which question triggered which reply)
 #                          # 设为 true 时，所有回复都会引用原消息（方便追踪每条回复对应哪条提问）
 
@@ -585,6 +637,8 @@ app_secret = "your-feishu-app-secret"
 #                   # 可选：设置后 slash 命令秒级生效（仅该服务器）
 # group_reply_all = false  # If true, respond to ALL guild messages without @mention / 设为 true 群聊无需 @ 也响应
 # share_session_in_channel = false  # If true, all users in a channel share one agent session / 频道共享会话
+# thread_isolation = false  # If true, cc-connect creates/uses Discord threads as session boundaries when the channel supports threads
+#                           # 设为 true 时，cc-connect 会在支持 thread 的 Discord 频道内按 thread 隔离会话
 
 # LINE (uncomment to enable / 取消注释以启用)
 # 1. Create a channel at https://developers.line.biz/console/ (Messaging API)
@@ -794,6 +848,14 @@ app_secret = "your-feishu-app-secret"
 # api_key = "sk-xxx"
 # base_url = "https://custom-api.com/v1"
 # model = "gpt-4o"
+#
+# # MiniMax — OpenAI-compatible, works natively with Codex
+# # MiniMax — 兼容 OpenAI 接口，可直接用于 Codex
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
 #
 # [[projects.platforms]]
 # type = "telegram"

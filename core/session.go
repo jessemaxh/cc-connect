@@ -15,6 +15,7 @@ type Session struct {
 	ID             string         `json:"id"`
 	Name           string         `json:"name"`
 	AgentSessionID string         `json:"agent_session_id"`
+	AgentType      string         `json:"agent_type,omitempty"`
 	History        []HistoryEntry `json:"history"`
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
@@ -50,30 +51,47 @@ func (s *Session) AddHistory(role, content string) {
 	})
 }
 
-// SetAgentInfo atomically sets the agent session ID and name.
-func (s *Session) SetAgentInfo(agentSessionID, name string) {
+// SetAgentInfo atomically sets the agent session ID, agent type, and name.
+func (s *Session) SetAgentInfo(agentSessionID, agentType, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AgentSessionID = agentSessionID
+	s.AgentType = agentType
 	s.Name = name
 }
 
-// SetAgentSessionID atomically sets the agent session ID.
-func (s *Session) SetAgentSessionID(id string) {
+// GetAgentSessionID atomically reads the agent session ID.
+func (s *Session) GetAgentSessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AgentSessionID
+}
+
+// GetName atomically reads the session name.
+func (s *Session) GetName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Name
+}
+
+// SetAgentSessionID atomically sets the agent session ID and agent type.
+func (s *Session) SetAgentSessionID(id, agentType string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AgentSessionID = id
+	s.AgentType = agentType
 }
 
 // CompareAndSetAgentSessionID sets the agent session ID only if it is currently empty.
 // Returns true if the value was set, false if it was already non-empty.
-func (s *Session) CompareAndSetAgentSessionID(id string) bool {
+func (s *Session) CompareAndSetAgentSessionID(id, agentType string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.AgentSessionID != "" {
 		return false
 	}
 	s.AgentSessionID = id
+	s.AgentType = agentType
 	return true
 }
 
@@ -230,6 +248,47 @@ func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 	return sm.sessionNames[agentSessionID]
 }
 
+// AllSessions returns all sessions across all user keys.
+func (sm *SessionManager) AllSessions() []*Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	out := make([]*Session, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+// FindByID looks up a session by its internal ID across all users.
+func (sm *SessionManager) FindByID(id string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[id]
+}
+
+// DeleteByID removes a session by its internal ID from all tracking structures.
+func (sm *SessionManager) DeleteByID(id string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if _, ok := sm.sessions[id]; !ok {
+		return false
+	}
+	delete(sm.sessions, id)
+	for userKey, ids := range sm.userSessions {
+		for i, sid := range ids {
+			if sid == id {
+				sm.userSessions[userKey] = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+		if sm.activeSession[userKey] == id {
+			delete(sm.activeSession, userKey)
+		}
+	}
+	sm.saveLocked()
+	return true
+}
+
 // Save persists current state to disk. Safe to call from outside (e.g. after message processing).
 func (sm *SessionManager) Save() {
 	sm.mu.RLock()
@@ -250,6 +309,7 @@ func (sm *SessionManager) saveLocked() {
 			ID:             s.ID,
 			Name:           s.Name,
 			AgentSessionID: s.AgentSessionID,
+			AgentType:      s.AgentType,
 			History:        append([]HistoryEntry(nil), s.History...),
 			CreatedAt:      s.CreatedAt,
 			UpdatedAt:      s.UpdatedAt,
@@ -311,4 +371,33 @@ func (sm *SessionManager) load() {
 	}
 
 	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions))
+}
+
+// InvalidateForAgent clears AgentSessionID on all sessions whose AgentType
+// does not match the current agent. This handles the case where the user
+// switches agent types (e.g. opencode → pi) and stale session IDs from the
+// old agent would cause errors.
+func (sm *SessionManager) InvalidateForAgent(agentType string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	invalidated := 0
+	for _, s := range sm.sessions {
+		s.mu.Lock()
+		if s.AgentSessionID != "" && s.AgentType != "" && s.AgentType != agentType {
+			slog.Info("session: invalidating stale agent session",
+				"session", s.ID,
+				"old_agent", s.AgentType,
+				"new_agent", agentType,
+				"old_agent_session_id", s.AgentSessionID,
+			)
+			s.AgentSessionID = ""
+			s.AgentType = agentType
+			invalidated++
+		}
+		s.mu.Unlock()
+	}
+	if invalidated > 0 {
+		sm.saveLocked()
+	}
 }

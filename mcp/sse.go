@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -156,8 +157,38 @@ func (t *sseTransport) Initialize(ctx context.Context) (*InitializeResult, error
 		return nil, fmt.Errorf("decode initialize result: %w", err)
 	}
 	// Send notifications/initialized as required by MCP spec.
-	_, _ = t.post(ctx, "notifications/initialized", nil)
+	// This is a JSON-RPC notification (no id field) — the server MUST NOT
+	// respond. We fire-and-forget; do NOT use post() which sets an id and
+	// blocks waiting for a response (that will never come).
+	t.notify(ctx, "notifications/initialized")
 	return &result, nil
+}
+
+// notify sends a JSON-RPC notification (no id, no expected response).
+// Errors are logged and ignored — notifications are best-effort.
+func (t *sseTransport) notify(ctx context.Context, method string) {
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		// Intentionally no ID — this is a notification per JSON-RPC 2.0 spec.
+		Method: method,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		strings.TrimRight(t.cfg.URL, "/")+"/message",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := t.client.Do(httpReq)
+	if err != nil {
+		slog.Debug("mcp sse: notify error (ignored)", "method", method, "error", err)
+		return
+	}
+	resp.Body.Close()
 }
 
 func (t *sseTransport) ListTools(ctx context.Context) ([]Tool, error) {

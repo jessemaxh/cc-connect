@@ -26,23 +26,26 @@ const (
 // apiSession manages a single multi-turn conversation via direct LLM API calls.
 // It supports an agentic tool-calling loop using MCP servers.
 type apiSession struct {
-	llm      *llmClient
-	mcp      *mcp.Manager
-	model    string
-	system   string
+	llm    *llmClient
+	mcp    *mcp.Manager
+	model  string
+	system string
 
 	history   []chatMessage
 	historyMu sync.Mutex
 
 	sessionID string
 	events    chan core.Event
-	ctx       context.Context
-	cancel    context.CancelFunc
-	alive     atomic.Bool
-	wg        sync.WaitGroup
+	// closeEventsOnce ensures events is closed exactly once, even if Close() is
+	// called concurrently or the 10-second watchdog fires while agentLoop is active.
+	closeEventsOnce sync.Once
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	alive  atomic.Bool
+	wg     sync.WaitGroup
 
 	// loopRunning ensures only one agentLoop runs at a time.
-	// CompareAndSwap(false, true) in Send; reset to false when loop exits.
 	loopRunning atomic.Bool
 }
 
@@ -91,14 +94,17 @@ func (s *apiSession) Send(prompt string, images []core.ImageAttachment, files []
 		}
 		userMsg = chatMessage{Role: "user", Content: parts}
 	} else {
-		// Append any file references as text.
 		text := prompt
 		if len(files) > 0 {
-			// Write attachments to a temp directory isolated per session.
+			// Write attachments to a session-scoped temp directory.
+			// Cleaned up after the turn completes in agentLoop.
 			tmpDir, err := os.MkdirTemp("", "cc-connect-api-*")
 			if err != nil {
 				slog.Warn("api session: cannot create temp dir for attachments", "error", err)
 				tmpDir = os.TempDir()
+			} else {
+				// Schedule cleanup at the end of this goroutine's turn.
+				defer os.RemoveAll(tmpDir) //nolint:errcheck
 			}
 			filePaths := core.SaveFilesToDisk(tmpDir, files)
 			text = core.AppendFileRefs(text, filePaths)
@@ -172,8 +178,20 @@ func (s *apiSession) agentLoop() {
 			return
 		}
 
-		// No tool calls → final response.
-		if len(allTCalls) == 0 {
+		// Filter to function-type only before building the assistant history message.
+		// Non-function tool types (e.g. "retrieval", "code_interpreter") are OpenAI
+		// built-ins that don't go through MCP; we cannot provide results for them,
+		// so including them in the assistant message would create orphaned tool_calls
+		// that the API would reject.
+		var functionTCalls []toolCall
+		for _, tc := range allTCalls {
+			if tc.Type == "function" || tc.Type == "" {
+				functionTCalls = append(functionTCalls, tc)
+			}
+		}
+
+		// No (function) tool calls → final response.
+		if len(functionTCalls) == 0 {
 			finalText := textBuf.String()
 			s.historyMu.Lock()
 			s.history = append(s.history, chatMessage{Role: "assistant", Content: finalText})
@@ -183,24 +201,21 @@ func (s *apiSession) agentLoop() {
 			return
 		}
 
-		// Append assistant message with tool_calls to history.
+		// Append assistant message with ONLY the function tool calls.
 		assistantMsg := chatMessage{
 			Role:      "assistant",
 			Content:   textBuf.String(),
-			ToolCalls: allTCalls,
+			ToolCalls: functionTCalls,
 		}
 		s.historyMu.Lock()
 		s.history = append(s.history, assistantMsg)
 		s.historyMu.Unlock()
 
 		// Execute each tool call via MCP, append results to history.
-		for _, tc := range allTCalls {
-			if tc.Type != "function" && tc.Type != "" {
-				continue
-			}
+		for _, tc := range functionTCalls {
 			s.emit(core.Event{
-				Type:     core.EventToolUse,
-				ToolName: tc.Function.Name,
+				Type:      core.EventToolUse,
+				ToolName:  tc.Function.Name,
 				ToolInput: tc.Function.Arguments,
 			})
 
@@ -251,8 +266,7 @@ func (s *apiSession) executeTool(tc toolCall) string {
 		return "error: " + strings.Join(parts, "\n")
 	}
 
-	parts := extractTextParts(result.Content)
-	return strings.Join(parts, "\n")
+	return strings.Join(extractTextParts(result.Content), "\n")
 }
 
 func extractTextParts(content []mcp.ToolContent) []string {
@@ -289,12 +303,16 @@ func (s *apiSession) buildToolDefs() []toolDef {
 }
 
 // trimHistory enforces the sliding window. Must be called with historyMu held.
-// It trims at user-message boundaries to avoid stranding partial tool-call sequences.
+// It always trims at user-message boundaries to avoid stranding tool/tool_calls
+// sequences. trimHistory is only called when appending user messages (before any
+// tool loop starts) and after final text-only responses, so there are no
+// mid-loop orphaned tool messages in the kept portion.
 func (s *apiSession) trimHistory() {
 	if len(s.history) <= maxHistoryMessages {
 		return
 	}
-	// Find the first user message within the window we want to keep.
+	// Scan forward from the natural trim point until we find a user message
+	// as the safe start of the kept window.
 	cutoff := len(s.history) - maxHistoryMessages
 	for cutoff < len(s.history) && s.history[cutoff].Role != "user" {
 		cutoff++
@@ -302,11 +320,14 @@ func (s *apiSession) trimHistory() {
 	if cutoff < len(s.history) {
 		s.history = s.history[cutoff:]
 	}
-	// If no user message was found in the window (unusual), keep history as-is
-	// to avoid stranding the LLM with an invalid message sequence.
 }
 
+// emit sends an event to the events channel.
+// Uses recover() to guard against the unlikely race where the channel is
+// closed (by the watchdog timeout in Close()) while this goroutine is still
+// active. In normal operation the ctx.Done() branch is taken instead.
 func (s *apiSession) emit(e core.Event) {
+	defer func() { recover() }() //nolint:errcheck
 	select {
 	case s.events <- e:
 	case <-s.ctx.Done():
@@ -320,6 +341,11 @@ func (s *apiSession) emitDone(text string) {
 		SessionID: s.sessionID,
 		Done:      true,
 	})
+}
+
+// doCloseEvents closes the events channel exactly once via sync.Once.
+func (s *apiSession) doCloseEvents() {
+	s.closeEventsOnce.Do(func() { close(s.events) })
 }
 
 // ---- core.AgentSession interface ----
@@ -340,17 +366,16 @@ func (s *apiSession) Alive() bool {
 	return s.alive.Load()
 }
 
-// Close cancels the session context and waits for the agentLoop to exit.
-// The events channel is closed after all goroutines have exited, so callers
-// can safely range over Events() until it closes.
-// Close() returns immediately; the events channel is closed asynchronously.
+// Close cancels the session context and arranges for the events channel to be
+// closed. It returns immediately; the channel is closed asynchronously once all
+// active goroutines have exited or a 10-second watchdog fires.
+//
+// The events channel is protected by sync.Once and emit() uses recover(), so
+// there is no panic even if a goroutine is still running when the watchdog fires.
 func (s *apiSession) Close() error {
 	s.alive.Store(false)
-	s.cancel()
+	s.cancel() // signals all in-flight LLM calls and MCP requests to abort
 
-	// Close events asynchronously after all goroutines exit, so that:
-	//  1. No double-close can occur (wg.Wait() guarantees all emitters are done).
-	//  2. The caller can continue to drain events until the channel closes.
 	go func() {
 		done := make(chan struct{})
 		go func() {
@@ -360,9 +385,9 @@ func (s *apiSession) Close() error {
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			slog.Warn("api session: close timed out waiting for agentLoop")
+			slog.Warn("api session: close timed out waiting for agentLoop to exit — goroutine may leak")
 		}
-		close(s.events)
+		s.doCloseEvents()
 	}()
 	return nil
 }

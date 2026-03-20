@@ -124,7 +124,12 @@ func (c *llmClient) complete(ctx context.Context, req completionRequest) <-chan 
 	go func() {
 		defer close(ch)
 		if err := c.streamRequest(ctx, req, ch); err != nil {
-			ch <- streamResult{err: err, done: true}
+			// Use select so we don't block forever if the caller abandoned
+			// the channel (e.g. broke out of the range loop on error).
+			select {
+			case ch <- streamResult{err: err, done: true}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return ch
@@ -269,9 +274,12 @@ func (c *llmClient) parseSSEStream(body io.Reader, ch chan<- streamResult) error
 }
 
 func flattenToolCalls(acc map[int]*toolCall) []toolCall {
-	calls := make([]toolCall, len(acc))
-	for i := range acc {
-		calls[i] = *acc[i]
+	// Use append (not index assignment) because stream indices may not be
+	// contiguous (e.g. 0 and 5), which would cause an out-of-bounds panic
+	// if we assumed len(acc) == max(index)+1.
+	calls := make([]toolCall, 0, len(acc))
+	for _, v := range acc {
+		calls = append(calls, *v)
 	}
 	return calls
 }

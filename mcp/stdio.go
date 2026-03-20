@@ -106,21 +106,18 @@ func (t *stdioTransport) call(ctx context.Context, method string, params any) (j
 	}
 
 	// Read lines until we find the response matching our ID.
+	// scanLine is context-aware: it spawns a goroutine for the blocking Scan()
+	// so that ctx cancellation can interrupt the wait. If ctx is cancelled, the
+	// goroutine remains blocked until Close() kills the subprocess, at which
+	// point Scan() returns false and the goroutine exits.
 	for {
-		// Check for cancellation before each scan attempt.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		line, ok, err := t.scanLine(ctx)
+		if err != nil {
+			return nil, err
 		}
-
-		if !t.dec.Scan() {
-			if err := t.dec.Err(); err != nil {
-				return nil, fmt.Errorf("read response: %w", err)
-			}
+		if !ok {
 			return nil, fmt.Errorf("server closed connection")
 		}
-		line := t.dec.Bytes()
 		if len(line) == 0 {
 			continue
 		}
@@ -159,6 +156,38 @@ func (t *stdioTransport) call(ctx context.Context, method string, params any) (j
 			return nil, resp.Error
 		}
 		return resp.Result, nil
+	}
+}
+
+type scanResult struct {
+	line []byte
+	ok   bool
+	err  error
+}
+
+// scanLine reads one line from the scanner with context cancellation support.
+// Must be called with callMu held. If ctx is cancelled, the background Scan()
+// goroutine will remain blocked until the subprocess exits (via Close()).
+func (t *stdioTransport) scanLine(ctx context.Context) ([]byte, bool, error) {
+	ch := make(chan scanResult, 1)
+	go func() {
+		ok := t.dec.Scan()
+		var b []byte
+		if ok {
+			raw := t.dec.Bytes()
+			b = make([]byte, len(raw))
+			copy(b, raw)
+		}
+		ch <- scanResult{line: b, ok: ok, err: t.dec.Err()}
+	}()
+	select {
+	case r := <-ch:
+		if !r.ok && r.err != nil {
+			return nil, false, fmt.Errorf("read response: %w", r.err)
+		}
+		return r.line, r.ok, nil
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
 	}
 }
 

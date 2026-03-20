@@ -10,17 +10,12 @@ import (
 
 // Transport is the interface that both stdio and HTTP/SSE transports implement.
 type Transport interface {
-	// Initialize performs the MCP handshake. Must be called before any other method.
 	Initialize(ctx context.Context) (*InitializeResult, error)
-	// ListTools returns all tools advertised by the server.
 	ListTools(ctx context.Context) ([]Tool, error)
-	// CallTool calls a named tool with the provided arguments.
 	CallTool(ctx context.Context, name string, args map[string]any) (*CallToolResult, error)
-	// Close tears down the transport.
 	Close() error
 }
 
-// serverEntry holds a transport and its cached tool list.
 type serverEntry struct {
 	cfg   ServerConfig
 	tr    Transport
@@ -29,19 +24,28 @@ type serverEntry struct {
 
 // Manager manages a pool of MCP server connections and routes tool calls.
 type Manager struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+
 	servers []*serverEntry
-	// qualifiedIndex: "<server>__<tool>" → entry (always populated)
-	// bareIndex:      "<tool>"           → entry (populated only when no collision)
+
+	// qualifiedIndex maps "<server>__<tool>" → entry (always populated).
 	qualifiedIndex map[string]*serverEntry
-	bareIndex      map[string]*serverEntry
+
+	// bareIndex maps "<tool>" → entry (populated only when there is exactly
+	// one server that provides a given tool name).
+	bareIndex map[string]*serverEntry
+
+	// collisionNames tracks bare tool names that appear on ≥2 servers.
+	// Once a name is in collisionNames it is NEVER re-added to bareIndex,
+	// even if a third server registers the same name.
+	collisionNames map[string]struct{}
 }
 
-// NewManager creates an empty manager. Call AddServer to register servers.
 func NewManager() *Manager {
 	return &Manager{
 		qualifiedIndex: make(map[string]*serverEntry),
 		bareIndex:      make(map[string]*serverEntry),
+		collisionNames: make(map[string]struct{}),
 	}
 }
 
@@ -82,10 +86,16 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 	for _, t := range tools {
 		qualified := cfg.Name + "__" + t.Name
 		m.qualifiedIndex[qualified] = entry
-		// Only register bare name if there is no collision; on collision remove it
-		// so callers are forced to use the qualified form.
-		if _, exists := m.bareIndex[t.Name]; exists {
+
+		// Bare name: register only when there is no collision. Track collisions in
+		// collisionNames so that a third server registering the same name doesn't
+		// silently re-activate the bare mapping.
+		if _, collided := m.collisionNames[t.Name]; collided {
+			// Already a known collision — never use bare name for this tool.
+		} else if _, exists := m.bareIndex[t.Name]; exists {
+			// First collision detected: remove bare mapping and mark as collided.
 			delete(m.bareIndex, t.Name)
+			m.collisionNames[t.Name] = struct{}{}
 		} else {
 			m.bareIndex[t.Name] = entry
 		}
@@ -93,13 +103,12 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 	return nil
 }
 
-// AllTools returns the merged list of all tools across all registered servers.
-// Tool names are prefixed with "<server>__" when there is a collision across servers.
+// AllTools returns the merged list of tools from all servers.
+// Colliding tool names are exposed as "<server>__<tool>"; unique names as-is.
 func (m *Manager) AllTools() []Tool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Count bare name occurrences to detect collisions.
 	counts := make(map[string]int)
 	for _, e := range m.servers {
 		for _, t := range e.tools {
@@ -111,7 +120,6 @@ func (m *Manager) AllTools() []Tool {
 	for _, e := range m.servers {
 		for _, t := range e.tools {
 			if counts[t.Name] > 1 {
-				// Disambiguate: expose as "<server>__<tool>"
 				t2 := t
 				t2.Name = e.cfg.Name + "__" + t.Name
 				out = append(out, t2)
@@ -124,10 +132,10 @@ func (m *Manager) AllTools() []Tool {
 }
 
 // CallTool dispatches a tool call to the appropriate server.
-// The name may be either the bare tool name or the "<server>__<tool>" qualified form.
+// Accepts both bare names and "<server>__<tool>" qualified names.
 func (m *Manager) CallTool(ctx context.Context, name string, args map[string]any) (*CallToolResult, error) {
 	m.mu.Lock()
-	// Try qualified name first (exact match in qualifiedIndex).
+	// Try qualified name first.
 	entry := m.qualifiedIndex[name]
 	if entry == nil {
 		// Try bare name.
@@ -139,13 +147,13 @@ func (m *Manager) CallTool(ctx context.Context, name string, args map[string]any
 		return nil, fmt.Errorf("mcp: unknown tool %q", name)
 	}
 
-	// Strip server prefix before forwarding to the transport.
-	// Use SplitN so that tool names containing "__" are preserved correctly.
+	// Strip the server prefix to get the bare tool name sent to the transport.
+	// Use the entry's own server name as the prefix to avoid ambiguity when
+	// the server name itself contains "__".
 	bareName := name
-	if strings.Contains(name, "__") {
-		if parts := strings.SplitN(name, "__", 2); len(parts) == 2 {
-			bareName = parts[1]
-		}
+	prefix := entry.cfg.Name + "__"
+	if strings.HasPrefix(name, prefix) {
+		bareName = name[len(prefix):]
 	}
 
 	return entry.tr.CallTool(ctx, bareName, args)
@@ -163,4 +171,5 @@ func (m *Manager) Close() {
 	m.servers = nil
 	m.qualifiedIndex = make(map[string]*serverEntry)
 	m.bareIndex = make(map[string]*serverEntry)
+	m.collisionNames = make(map[string]struct{})
 }

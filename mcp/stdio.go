@@ -11,22 +11,35 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
+// lineResult is one line produced by the dedicated reader goroutine.
+type lineResult struct {
+	bytes []byte
+	err   error // non-nil only on scanner error (not EOF)
+}
+
 // stdioTransport implements MCP over JSON-RPC on stdin/stdout of a subprocess.
+//
+// Design: a single dedicated readLoop goroutine owns the bufio.Scanner. It sends
+// lines to linesCh. call() reads from linesCh using a select, so context
+// cancellation is prompt and there is never more than one goroutine touching
+// the scanner.
 type stdioTransport struct {
 	cfg    ServerConfig
 	nextID atomic.Int64
 
-	// startMu protects the startup fields and Close().
-	startMu  sync.Mutex
-	started  bool
-	startErr error
-	cmd      *exec.Cmd
-	enc      *json.Encoder
-	dec      *bufio.Scanner
+	// startMu protects startup fields and Close().
+	startMu    sync.Mutex
+	started    bool
+	startErr   error
+	cmd        *exec.Cmd
+	enc        *json.Encoder
+	linesCh    chan lineResult
+	readerDone chan struct{} // closed when readLoop exits
 
-	// callMu serialises request/response pairs (one outstanding call at a time).
+	// callMu serialises request/response pairs (one at a time).
 	callMu sync.Mutex
 }
 
@@ -37,9 +50,8 @@ func newStdioTransport(cfg ServerConfig) (*stdioTransport, error) {
 	return &stdioTransport{cfg: cfg}, nil
 }
 
-// start launches the subprocess on the first call. Subsequent calls are no-ops
-// and return the result of the first attempt. Uses startMu (not sync.Once) so
-// that a failed start can be diagnosed and the error is always readable.
+// start launches the subprocess on the first call. Thread-safe; subsequent
+// calls return the result of the first attempt.
 func (t *stdioTransport) start() error {
 	t.startMu.Lock()
 	defer t.startMu.Unlock()
@@ -49,10 +61,8 @@ func (t *stdioTransport) start() error {
 	}
 	t.started = true
 
-	args := t.cfg.Args
-	cmd := exec.Command(t.cfg.Command, args...) //nolint:gosec — command comes from operator config
+	cmd := exec.Command(t.cfg.Command, t.cfg.Args...) //nolint:gosec — operator config only
 
-	// Build env: inherit parent env and add overrides.
 	env := os.Environ()
 	for k, v := range t.cfg.Env {
 		env = append(env, k+"="+v)
@@ -69,8 +79,7 @@ func (t *stdioTransport) start() error {
 		t.startErr = fmt.Errorf("stdout pipe: %w", err)
 		return t.startErr
 	}
-	// Discard stderr so it doesn't inherit the parent's stderr and doesn't block.
-	cmd.Stderr = io.Discard
+	cmd.Stderr = io.Discard // discard, not nil (nil inherits parent stderr)
 
 	if err := cmd.Start(); err != nil {
 		t.startErr = fmt.Errorf("start: %w", err)
@@ -79,12 +88,39 @@ func (t *stdioTransport) start() error {
 
 	t.cmd = cmd
 	t.enc = json.NewEncoder(stdin)
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	t.dec = scanner
+	t.linesCh = make(chan lineResult, 64)
+	t.readerDone = make(chan struct{})
+	go t.readLoop(stdout)
 	return nil
 }
 
+// readLoop is the SOLE goroutine that reads from the subprocess stdout.
+// Owning the scanner exclusively eliminates all data races on bufio.Scanner.
+// It runs for the lifetime of the transport and exits when the subprocess
+// closes its stdout (after Kill or natural exit).
+func (t *stdioTransport) readLoop(stdout io.ReadCloser) {
+	defer close(t.readerDone)
+	defer close(t.linesCh)
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		b := make([]byte, len(scanner.Bytes()))
+		copy(b, scanner.Bytes())
+		t.linesCh <- lineResult{bytes: b}
+	}
+	if err := scanner.Err(); err != nil {
+		// Best-effort send; Close() may be draining the channel concurrently.
+		select {
+		case t.linesCh <- lineResult{err: err}:
+		default:
+		}
+	}
+}
+
+// call sends a JSON-RPC request and reads the matching response.
+// It serialises access via callMu so that only one request is outstanding at a time.
+// Context cancellation is detected promptly via select on linesCh.
 func (t *stdioTransport) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	if err := t.start(); err != nil {
 		return nil, err
@@ -105,36 +141,37 @@ func (t *stdioTransport) call(ctx context.Context, method string, params any) (j
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
 
-	// Read lines until we find the response matching our ID.
-	// scanLine is context-aware: it spawns a goroutine for the blocking Scan()
-	// so that ctx cancellation can interrupt the wait. If ctx is cancelled, the
-	// goroutine remains blocked until Close() kills the subprocess, at which
-	// point Scan() returns false and the goroutine exits.
 	for {
-		line, ok, err := t.scanLine(ctx)
-		if err != nil {
-			return nil, err
+		var r lineResult
+		var ok bool
+		select {
+		case r, ok = <-t.linesCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
+
 		if !ok {
 			return nil, fmt.Errorf("server closed connection")
 		}
-		if len(line) == 0 {
+		if r.err != nil {
+			return nil, fmt.Errorf("read response: %w", r.err)
+		}
+		if len(r.bytes) == 0 {
 			continue
 		}
 
 		var resp jsonrpcResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
-			slog.Debug("mcp stdio: skip non-JSON line", "line", string(line[:min(len(line), 120)]))
+		if err := json.Unmarshal(r.bytes, &resp); err != nil {
+			slog.Debug("mcp stdio: skip non-JSON line", "line", string(r.bytes[:min(len(r.bytes), 120)]))
 			continue
 		}
 
-		// Notifications from the server (no ID or null ID) — skip them.
+		// Skip server-initiated notifications (no ID).
 		if resp.ID == nil {
 			continue
 		}
 
-		// Check if this response matches our request ID.
-		// IDs come back as float64 when unmarshalled into any.
+		// Match response ID to our request.
 		switch v := resp.ID.(type) {
 		case float64:
 			if int64(v) != id {
@@ -159,38 +196,6 @@ func (t *stdioTransport) call(ctx context.Context, method string, params any) (j
 	}
 }
 
-type scanResult struct {
-	line []byte
-	ok   bool
-	err  error
-}
-
-// scanLine reads one line from the scanner with context cancellation support.
-// Must be called with callMu held. If ctx is cancelled, the background Scan()
-// goroutine will remain blocked until the subprocess exits (via Close()).
-func (t *stdioTransport) scanLine(ctx context.Context) ([]byte, bool, error) {
-	ch := make(chan scanResult, 1)
-	go func() {
-		ok := t.dec.Scan()
-		var b []byte
-		if ok {
-			raw := t.dec.Bytes()
-			b = make([]byte, len(raw))
-			copy(b, raw)
-		}
-		ch <- scanResult{line: b, ok: ok, err: t.dec.Err()}
-	}()
-	select {
-	case r := <-ch:
-		if !r.ok && r.err != nil {
-			return nil, false, fmt.Errorf("read response: %w", r.err)
-		}
-		return r.line, r.ok, nil
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
-	}
-}
-
 func (t *stdioTransport) Initialize(ctx context.Context) (*InitializeResult, error) {
 	params := InitializeParams{
 		ProtocolVersion: "2024-11-05",
@@ -205,7 +210,9 @@ func (t *stdioTransport) Initialize(ctx context.Context) (*InitializeResult, err
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("decode initialize result: %w", err)
 	}
-	// Send initialized notification (fire-and-forget, spec requirement).
+	// Send notifications/initialized while holding callMu so that no other
+	// request (e.g. ListTools) can slip in before the notification is sent
+	// (MCP spec requires initialized notification before any subsequent request).
 	t.callMu.Lock()
 	_ = t.enc.Encode(jsonrpcRequest{JSONRPC: "2.0", Method: "notifications/initialized"})
 	t.callMu.Unlock()
@@ -237,26 +244,41 @@ func (t *stdioTransport) CallTool(ctx context.Context, name string, args map[str
 	return &result, nil
 }
 
-// Close kills the subprocess. It first sends SIGKILL (which unblocks any
-// in-progress Scan()), then waits for the active call to release callMu
-// before calling cmd.Wait() to reap the zombie.
+// Close kills the subprocess and waits for the reader goroutine to exit before
+// calling cmd.Wait(), preventing use-after-close on the stdout file descriptor.
 func (t *stdioTransport) Close() error {
 	t.startMu.Lock()
 	cmd := t.cmd
+	linesCh := t.linesCh
+	readerDone := t.readerDone
 	t.startMu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 
-	// Kill first: this makes any blocked Scan() in call() return immediately.
+	// Kill the subprocess: causes readLoop's scanner to see EOF and exit.
 	_ = cmd.Process.Kill()
 
-	// Wait for the in-progress call (if any) to observe the EOF and release callMu.
-	t.callMu.Lock()
-	t.callMu.Unlock() //nolint:staticcheck — intentional: just waiting for in-flight call to exit
+	// Drain linesCh so readLoop is not blocked trying to send. The drain
+	// goroutine exits automatically when linesCh is closed (after readLoop exits).
+	if linesCh != nil {
+		go func() {
+			for range linesCh {
+			}
+		}()
+	}
 
-	// Now safe to reap.
+	// Wait for readLoop to exit before calling cmd.Wait() to avoid a
+	// use-after-close race on the stdout file descriptor.
+	if readerDone != nil {
+		select {
+		case <-readerDone:
+		case <-time.After(5 * time.Second):
+			slog.Warn("mcp stdio: reader goroutine did not exit after Kill")
+		}
+	}
+
 	_ = cmd.Wait()
 	return nil
 }

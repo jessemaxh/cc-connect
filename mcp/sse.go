@@ -157,10 +157,14 @@ func (t *sseTransport) Initialize(ctx context.Context) (*InitializeResult, error
 		return nil, fmt.Errorf("decode initialize result: %w", err)
 	}
 	// Send notifications/initialized as required by MCP spec.
-	// This is a JSON-RPC notification (no id field) — the server MUST NOT
-	// respond. We fire-and-forget; do NOT use post() which sets an id and
-	// blocks waiting for a response (that will never come).
-	t.notify(ctx, "notifications/initialized")
+	// This is a JSON-RPC notification (no id field) — the server MUST NOT respond.
+	// Run asynchronously with a short deadline so a slow server does not consume
+	// the caller's initialization timeout budget.
+	go func() {
+		nCtx, nCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer nCancel()
+		t.notify(nCtx, "notifications/initialized")
+	}()
 	return &result, nil
 }
 

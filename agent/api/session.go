@@ -24,7 +24,6 @@ const (
 )
 
 // apiSession manages a single multi-turn conversation via direct LLM API calls.
-// It supports an agentic tool-calling loop using MCP servers.
 type apiSession struct {
 	llm    *llmClient
 	mcp    *mcp.Manager
@@ -36,8 +35,8 @@ type apiSession struct {
 
 	sessionID string
 	events    chan core.Event
-	// closeEventsOnce ensures events is closed exactly once, even if Close() is
-	// called concurrently or the 10-second watchdog fires while agentLoop is active.
+	// closeEventsOnce ensures events is closed exactly once across normal exit,
+	// timeout path, and any future code paths.
 	closeEventsOnce sync.Once
 
 	ctx    context.Context
@@ -45,7 +44,7 @@ type apiSession struct {
 	alive  atomic.Bool
 	wg     sync.WaitGroup
 
-	// loopRunning ensures only one agentLoop runs at a time.
+	// loopRunning ensures only one agentLoop goroutine runs at a time.
 	loopRunning atomic.Bool
 }
 
@@ -70,9 +69,8 @@ func newAPISession(
 	return s
 }
 
-// Send implements core.AgentSession. It appends the user message to history
-// and launches the agentic loop in a goroutine. Returns an error if the session
-// is already processing a previous message.
+// Send implements core.AgentSession. Appends the user message to history and
+// launches agentLoop in a goroutine. Returns an error if a loop is already running.
 func (s *apiSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
@@ -95,23 +93,45 @@ func (s *apiSession) Send(prompt string, images []core.ImageAttachment, files []
 		userMsg = chatMessage{Role: "user", Content: parts}
 	} else {
 		text := prompt
+		// Capture tmpDir here so the goroutine can clean it up after the LLM call.
+		// Do NOT defer RemoveAll in Send() — the defer fires when Send() returns,
+		// before agentLoop starts, so the files would be deleted too early.
+		var tmpDir string
 		if len(files) > 0 {
-			// Write attachments to a session-scoped temp directory.
-			// Cleaned up after the turn completes in agentLoop.
-			tmpDir, err := os.MkdirTemp("", "cc-connect-api-*")
+			var err error
+			tmpDir, err = os.MkdirTemp("", "cc-connect-api-*")
 			if err != nil {
 				slog.Warn("api session: cannot create temp dir for attachments", "error", err)
-				tmpDir = os.TempDir()
-			} else {
-				// Schedule cleanup at the end of this goroutine's turn.
-				defer os.RemoveAll(tmpDir) //nolint:errcheck
+				tmpDir = ""
 			}
-			filePaths := core.SaveFilesToDisk(tmpDir, files)
+			filePaths := core.SaveFilesToDisk(func() string {
+				if tmpDir != "" {
+					return tmpDir
+				}
+				return os.TempDir()
+			}(), files)
 			text = core.AppendFileRefs(text, filePaths)
 		}
 		userMsg = chatMessage{Role: "user", Content: text}
+
+		s.historyMu.Lock()
+		s.history = append(s.history, userMsg)
+		s.trimHistory()
+		s.historyMu.Unlock()
+
+		s.wg.Add(1)
+		go func() {
+			defer s.loopRunning.Store(false)
+			// Clean up temp files AFTER agentLoop returns (after the LLM has used the paths).
+			if tmpDir != "" {
+				defer os.RemoveAll(tmpDir) //nolint:errcheck
+			}
+			s.agentLoop()
+		}()
+		return nil
 	}
 
+	// Image path: no temp files needed.
 	s.historyMu.Lock()
 	s.history = append(s.history, userMsg)
 	s.trimHistory()
@@ -125,7 +145,7 @@ func (s *apiSession) Send(prompt string, images []core.ImageAttachment, files []
 	return nil
 }
 
-// agentLoop runs the LLM → tool → LLM cycle until the model returns a text-only response.
+// agentLoop runs the LLM → tool → LLM cycle until the model returns text-only.
 func (s *apiSession) agentLoop() {
 	defer s.wg.Done()
 
@@ -160,7 +180,12 @@ func (s *apiSession) agentLoop() {
 		for chunk := range s.llm.complete(s.ctx, req) {
 			if chunk.err != nil {
 				slog.Error("api session: llm error", "error", chunk.err)
-				s.emit(core.Event{Type: core.EventError, Error: chunk.err})
+				s.emit(core.Event{
+					Type:      core.EventError,
+					Error:     chunk.err,
+					Done:      true,
+					SessionID: s.sessionID,
+				})
 				hasErr = true
 				break
 			}
@@ -174,15 +199,12 @@ func (s *apiSession) agentLoop() {
 		}
 
 		if hasErr {
-			s.emitDone("")
 			return
 		}
 
-		// Filter to function-type only before building the assistant history message.
-		// Non-function tool types (e.g. "retrieval", "code_interpreter") are OpenAI
-		// built-ins that don't go through MCP; we cannot provide results for them,
-		// so including them in the assistant message would create orphaned tool_calls
-		// that the API would reject.
+		// Filter to function-type only: non-function types (e.g. "retrieval",
+		// "code_interpreter") are OpenAI built-ins we can't call via MCP. Including
+		// them in the assistant message without a matching tool response causes 400.
 		var functionTCalls []toolCall
 		for _, tc := range allTCalls {
 			if tc.Type == "function" || tc.Type == "" {
@@ -190,28 +212,32 @@ func (s *apiSession) agentLoop() {
 			}
 		}
 
-		// No (function) tool calls → final response.
+		// No function tool calls → final text response.
 		if len(functionTCalls) == 0 {
 			finalText := textBuf.String()
 			s.historyMu.Lock()
 			s.history = append(s.history, chatMessage{Role: "assistant", Content: finalText})
 			s.trimHistory()
 			s.historyMu.Unlock()
-			s.emitDone(finalText)
+			s.emit(core.Event{
+				Type:      core.EventResult,
+				Content:   finalText,
+				SessionID: s.sessionID,
+				Done:      true,
+			})
 			return
 		}
 
-		// Append assistant message with ONLY the function tool calls.
-		assistantMsg := chatMessage{
+		// Append assistant message with ONLY function tool calls.
+		s.historyMu.Lock()
+		s.history = append(s.history, chatMessage{
 			Role:      "assistant",
 			Content:   textBuf.String(),
 			ToolCalls: functionTCalls,
-		}
-		s.historyMu.Lock()
-		s.history = append(s.history, assistantMsg)
+		})
 		s.historyMu.Unlock()
 
-		// Execute each tool call via MCP, append results to history.
+		// Execute each tool call, append result to history.
 		for _, tc := range functionTCalls {
 			s.emit(core.Event{
 				Type:      core.EventToolUse,
@@ -236,11 +262,21 @@ func (s *apiSession) agentLoop() {
 			})
 			s.historyMu.Unlock()
 		}
+
+		// Trim after each complete tool-exchange iteration so the history doesn't
+		// grow without bound during long tool loops (20 iter × N tools × large results).
+		s.historyMu.Lock()
+		s.trimHistory()
+		s.historyMu.Unlock()
 	}
 
 	// Exceeded iteration limit.
-	s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)})
-	s.emitDone("")
+	s.emit(core.Event{
+		Type:      core.EventError,
+		Error:     fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations),
+		Done:      true,
+		SessionID: s.sessionID,
+	})
 }
 
 func (s *apiSession) executeTool(tc toolCall) string {
@@ -250,22 +286,17 @@ func (s *apiSession) executeTool(tc toolCall) string {
 			return fmt.Sprintf("error: could not parse arguments: %v", err)
 		}
 	}
-
 	if s.mcp == nil {
 		return fmt.Sprintf("error: no MCP servers configured, cannot call tool %q", tc.Function.Name)
 	}
-
 	result, err := s.mcp.CallTool(s.ctx, tc.Function.Name, args)
 	if err != nil {
 		slog.Warn("api session: tool call failed", "tool", tc.Function.Name, "error", err)
 		return fmt.Sprintf("error: %v", err)
 	}
-
 	if result.IsError {
-		parts := extractTextParts(result.Content)
-		return "error: " + strings.Join(parts, "\n")
+		return "error: " + strings.Join(extractTextParts(result.Content), "\n")
 	}
-
 	return strings.Join(extractTextParts(result.Content), "\n")
 }
 
@@ -302,17 +333,14 @@ func (s *apiSession) buildToolDefs() []toolDef {
 	return defs
 }
 
-// trimHistory enforces the sliding window. Must be called with historyMu held.
-// It always trims at user-message boundaries to avoid stranding tool/tool_calls
-// sequences. trimHistory is only called when appending user messages (before any
-// tool loop starts) and after final text-only responses, so there are no
-// mid-loop orphaned tool messages in the kept portion.
+// trimHistory trims the history to maxHistoryMessages, always starting at a
+// user-message boundary to prevent orphaned tool sequences. Called only at
+// safe boundaries: after user message append, after final assistant response,
+// and after each tool-loop iteration.
 func (s *apiSession) trimHistory() {
 	if len(s.history) <= maxHistoryMessages {
 		return
 	}
-	// Scan forward from the natural trim point until we find a user message
-	// as the safe start of the kept window.
 	cutoff := len(s.history) - maxHistoryMessages
 	for cutoff < len(s.history) && s.history[cutoff].Role != "user" {
 		cutoff++
@@ -323,9 +351,8 @@ func (s *apiSession) trimHistory() {
 }
 
 // emit sends an event to the events channel.
-// Uses recover() to guard against the unlikely race where the channel is
-// closed (by the watchdog timeout in Close()) while this goroutine is still
-// active. In normal operation the ctx.Done() branch is taken instead.
+// recover() guards against the rare race where the channel was closed by the
+// watchdog timeout while this goroutine's ctx.Done() branch wasn't taken.
 func (s *apiSession) emit(e core.Event) {
 	defer func() { recover() }() //nolint:errcheck
 	select {
@@ -334,60 +361,33 @@ func (s *apiSession) emit(e core.Event) {
 	}
 }
 
-func (s *apiSession) emitDone(text string) {
-	s.emit(core.Event{
-		Type:      core.EventResult,
-		Content:   text,
-		SessionID: s.sessionID,
-		Done:      true,
-	})
-}
-
-// doCloseEvents closes the events channel exactly once via sync.Once.
-func (s *apiSession) doCloseEvents() {
-	s.closeEventsOnce.Do(func() { close(s.events) })
-}
-
 // ---- core.AgentSession interface ----
 
-func (s *apiSession) RespondPermission(_ string, _ core.PermissionResult) error {
-	return nil
-}
+func (s *apiSession) RespondPermission(_ string, _ core.PermissionResult) error { return nil }
 
-func (s *apiSession) Events() <-chan core.Event {
-	return s.events
-}
+func (s *apiSession) Events() <-chan core.Event { return s.events }
 
-func (s *apiSession) CurrentSessionID() string {
-	return s.sessionID
-}
+func (s *apiSession) CurrentSessionID() string { return s.sessionID }
 
-func (s *apiSession) Alive() bool {
-	return s.alive.Load()
-}
+func (s *apiSession) Alive() bool { return s.alive.Load() }
 
 // Close cancels the session context and arranges for the events channel to be
-// closed. It returns immediately; the channel is closed asynchronously once all
-// active goroutines have exited or a 10-second watchdog fires.
-//
-// The events channel is protected by sync.Once and emit() uses recover(), so
-// there is no panic even if a goroutine is still running when the watchdog fires.
+// closed asynchronously. The channel is protected by sync.Once and emit() uses
+// recover(), so there is no panic even if the watchdog fires while a goroutine
+// is still active.
 func (s *apiSession) Close() error {
 	s.alive.Store(false)
-	s.cancel() // signals all in-flight LLM calls and MCP requests to abort
+	s.cancel()
 
 	go func() {
 		done := make(chan struct{})
-		go func() {
-			s.wg.Wait()
-			close(done)
-		}()
+		go func() { s.wg.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			slog.Warn("api session: close timed out waiting for agentLoop to exit — goroutine may leak")
+			slog.Warn("api session: close timed out — agentLoop goroutine may leak")
 		}
-		s.doCloseEvents()
+		s.closeEventsOnce.Do(func() { close(s.events) })
 	}()
 	return nil
 }

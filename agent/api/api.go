@@ -87,11 +87,6 @@ func New(opts map[string]any) (core.Agent, error) {
 }
 
 func (a *Agent) loadMCPServers(servers []any) error {
-	// Use a bounded timeout so a slow or unresponsive MCP server doesn't block
-	// daemon startup indefinitely.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	var lastErr error
 	for _, raw := range servers {
 		m, ok := raw.(map[string]any)
@@ -121,7 +116,12 @@ func (a *Agent) loadMCPServers(servers []any) error {
 		if cfg.Name == "" {
 			cfg.Name = cfg.Command
 		}
-		if err := a.mcpMgr.AddServer(ctx, cfg); err != nil {
+		// Each server gets its own 30-second budget so a slow server doesn't
+		// starve subsequent ones.
+		svrCtx, svrCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := a.mcpMgr.AddServer(svrCtx, cfg)
+		svrCancel()
+		if err != nil {
 			slog.Error("api agent: connect MCP server", "name", cfg.Name, "error", err)
 			lastErr = err
 		}

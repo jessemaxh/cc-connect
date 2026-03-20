@@ -180,6 +180,8 @@ type Engine struct {
 	quiet   bool // when true, suppress thinking and tool progress messages globally
 
 	activeTurns atomic.Int32
+
+	welcomeSent sync.Map // sessionKey → time.Time; tracks first message per session, evicted after 24h
 }
 
 // workspaceInitFlow tracks a channel that is being onboarded to a workspace.
@@ -242,6 +244,15 @@ func (e *Engine) runIdleReaper() {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
+			// Evict stale welcomeSent entries older than 24h.
+			cutoff := time.Now().Add(-24 * time.Hour)
+			e.welcomeSent.Range(func(key, value any) bool {
+				if t, ok := value.(time.Time); ok && t.Before(cutoff) {
+					e.welcomeSent.Delete(key)
+				}
+				return true
+			})
+
 			if e.workspacePool == nil {
 				continue
 			}

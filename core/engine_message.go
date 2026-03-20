@@ -209,6 +209,18 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
+	// First message welcome: inject skill awareness into first user message.
+	// Entries auto-expire after 24h (cleaned by runIdleReaper) so the map doesn't grow unbounded.
+	if _, loaded := e.welcomeSent.LoadOrStore(msg.SessionKey, time.Now()); !loaded {
+		if !strings.HasPrefix(content, "/") {
+			welcomeCtx := e.buildWelcomeContext()
+			if welcomeCtx != "" {
+				msg.Content = msg.Content + "\n\n" + welcomeCtx
+				content = msg.Content
+			}
+		}
+	}
+
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
 		if e.handleCommand(p, msg, content) {
 			return
@@ -289,4 +301,10 @@ func (e *Engine) handleVoiceMessage(p Platform, msg *Message) {
 	msg.Content = text
 	msg.FromVoice = true
 	e.handleMessage(p, msg)
+}
+
+// buildWelcomeContext returns a hidden context appended to the first user message,
+// prompting the AI to naturally introduce its capabilities.
+func (e *Engine) buildWelcomeContext() string {
+	return `[System: This is the user's first message. After answering their question, briefly mention 1-2 of your key capabilities (e.g. weather, search, reminders) so they know what you can do. Keep it natural and short — one sentence is enough. Do NOT list all capabilities.]`
 }

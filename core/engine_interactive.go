@@ -294,11 +294,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// the interactive path was missing it, leaving a window where the local
 	// session could lose its agent binding.
 	if newID := agentSession.CurrentSessionID(); newID != "" {
-		session.mu.Lock()
-		if session.AgentSessionID == "" {
-			session.AgentSessionID = newID
-		}
-		session.mu.Unlock()
+		session.CompareAndSetAgentSessionID(newID, agent.Name())
 	}
 
 	state = &interactiveState{
@@ -462,17 +458,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 			if event.SessionID != "" {
-				session.mu.Lock()
-				if session.AgentSessionID == "" {
-					session.AgentSessionID = event.SessionID
+				if session.CompareAndSetAgentSessionID(event.SessionID, agent.Name()) {
+					session.mu.Lock()
 					pendingName := session.Name
 					session.mu.Unlock()
 					if pendingName != "" && pendingName != "session" && pendingName != "default" {
 						e.sessions.SetSessionName(event.SessionID, pendingName)
 					}
 					e.sessions.Save()
-				} else {
-					session.mu.Unlock()
 				}
 			}
 
@@ -544,9 +537,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				latestUsage = event.Usage
 			}
 			if event.SessionID != "" {
-				session.mu.Lock()
-				session.AgentSessionID = event.SessionID
-				session.mu.Unlock()
+				session.SetAgentSessionID(event.SessionID, agent.Name())
 			}
 
 			fullResponse := event.Content

@@ -791,7 +791,7 @@ app_secret = "your-feishu-app-secret"
 #
 # # Provider with API key / 使用 API Key 的 Provider
 # [[projects.agent.providers]]
-# name = "google"
+# name = "gemini"
 # api_key = "your-gemini-api-key"    # GEMINI_API_KEY
 #
 # # Vertex AI provider / Vertex AI 提供商
